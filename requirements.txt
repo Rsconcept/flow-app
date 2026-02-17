@@ -1,7 +1,8 @@
 streamlit
-requests
 pandas
+requests
 streamlit-autorefresh
+
 
 
 
