@@ -1,20 +1,31 @@
-import os
-import math
+import os, time
 from datetime import datetime, timedelta, timezone
-
 import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+st.set_page_config(page_title="5m Score + UW Flow + News", layout="wide")
 
-# =============================
-# CONFIG
-# =============================
-st.set_page_config(page_title="Flow + News + Live Score", layout="wide")
+UTC = timezone.utc
 
 DEFAULT_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "TSLA", "AMD", "NVDA"]
 
+# --- Secrets ---
+POLYGON_API_KEY = st.secrets.get("POLYGON_API_KEY", os.getenv("POLYGON_API_KEY", "")).strip()
+UW_API_KEY = st.secrets.get("UNUSUAL_WHALES_API_KEY", os.getenv("UNUSUAL_WHALES_API_KEY", "")).strip()
+
+# You must add this in Secrets once you locate it:
+UW_FLOW_ALERTS_URL = st.secrets.get("UW_FLOW_ALERTS_URL", os.getenv("UW_FLOW_ALERTS_URL", "")).strip()
+
+# Contract flow (you already have this)
+UW_CONTRACT_FLOW_URL = st.secrets.get(
+    "UW_CONTRACT_FLOW_URL",
+    os.getenv("UW_CONTRACT_FLOW_URL", "https://api.unusualwhales.com/api/option-contract/{id}/flow")
+).strip()
+
+# Your UW screener webpage (iframe only)
 UW_SCREENER_URL = (
     "https://unusualwhales.com/options-screener"
     "?close_greater_avg=true&exclude_ex_div_ticker=true&exclude_itm=true"
@@ -24,400 +35,313 @@ UW_SCREENER_URL = (
     "&order=premium&order_direction=desc&watchlist_name=GPT%20Filter%20"
 )
 
-POLYGON_API_KEY = st.secrets.get("POLYGON_API_KEY", os.getenv("POLYGON_API_KEY", "")).strip()
+# -----------------------------
+# Indicators
+# -----------------------------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-POLYGON_BASE = "https://api.polygon.io"
-USER_AGENT = {"User-Agent": "streamlit-flow-news/1.0"}
+def rsi(close, n=14):
+    d = close.diff()
+    up = d.clip(lower=0)
+    dn = (-d).clip(lower=0)
+    rs = up.ewm(alpha=1/n, adjust=False).mean() / (dn.ewm(alpha=1/n, adjust=False).mean() + 1e-9)
+    return 100 - (100 / (1 + rs))
 
+def macd(close, fast=12, slow=26, sig=9):
+    line = ema(close, fast) - ema(close, slow)
+    signal = ema(line, sig)
+    hist = line - signal
+    return line, signal, hist
 
-# =============================
-# SMALL UTIL
-# =============================
 def utc_now():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-# =============================
-# TECHNICAL INDICATORS (pandas only)
-# =============================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / (avg_loss.replace(0, float("nan")))
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(method="bfill").fillna(50)
-
-
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    fast_ema = ema(close, fast)
-    slow_ema = ema(close, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-# =============================
-# POLYGON FETCH
-# =============================
-@st.cache_data(ttl=30, show_spinner=False)
-def polygon_minute_bars(ticker: str, minutes_back: int, api_key: str) -> pd.DataFrame:
-    """
-    Fetch 1-minute aggregates for last `minutes_back` minutes.
-    """
-    if not api_key:
-        return pd.DataFrame()
+# -----------------------------
+# Polygon: price (1m bars) -> resample to 5m
+# -----------------------------
+@st.cache_data(ttl=20)
+def polygon_1m_bars(ticker: str, minutes_back: int):
+    if not POLYGON_API_KEY:
+        raise RuntimeError("Missing POLYGON_API_KEY in Secrets")
 
     end = utc_now()
     start = end - timedelta(minutes=minutes_back)
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{start:%Y-%m-%d}/{end:%Y-%m-%d}"
+    params = {"adjusted":"true", "sort":"asc", "limit":50000, "apiKey": POLYGON_API_KEY}
+    r = requests.get(url, params=params, timeout=20)
 
-    # Polygon expects dates; but minute range works with YYYY-MM-DD.
-    # We pass a slightly wider date range and rely on returned timestamps.
-    url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/minute/{start.date()}/{end.date()}"
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": api_key,
-    }
-
-    r = requests.get(url, params=params, headers=USER_AGENT, timeout=20)
     if r.status_code == 429:
-        return pd.DataFrame()  # rate-limited
+        raise RuntimeError("Polygon 429 rate limit. Increase refresh seconds or reduce tickers.")
     r.raise_for_status()
-    data = r.json() or {}
-    results = data.get("results", []) or []
-    if not results:
+
+    data = r.json().get("results", []) or []
+    if not data:
         return pd.DataFrame()
 
-    df = pd.DataFrame(results)
-    # Polygon fields: t=ms epoch, o,h,l,c,v
+    df = pd.DataFrame(data)
     df["dt"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("dt").sort_index()
-    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-    # Keep only window
-    df = df[df.index >= start]
-    return df[["open", "high", "low", "close", "volume"]].copy()
+    df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+    return df[["dt","open","high","low","close","volume"]].set_index("dt")
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def polygon_news(ticker: str, minutes_back: int, api_key: str) -> list[dict]:
-    """
-    Fetch news for ticker and then filter locally by published_utc within minutes_back.
-    """
-    if not api_key:
-        return []
-
-    url = f"{POLYGON_BASE}/v2/reference/news"
-    params = {
-        "ticker": ticker,
-        "limit": 50,
-        "order": "desc",
-        "sort": "published_utc",
-        "apiKey": api_key,
-    }
-
-    r = requests.get(url, params=params, headers=USER_AGENT, timeout=20)
-    if r.status_code == 429:
-        return []
-    r.raise_for_status()
-    data = r.json() or {}
-    items = data.get("results", []) or []
-
-    cutoff = utc_now() - timedelta(minutes=minutes_back)
-    out = []
-    for it in items:
-        try:
-            pu = pd.to_datetime(it.get("published_utc"), utc=True)
-            if pu >= cutoff:
-                out.append(it)
-        except Exception:
-            continue
+def to_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
+    if df_1m.empty:
+        return df_1m
+    o = df_1m["open"].resample("5min").first()
+    h = df_1m["high"].resample("5min").max()
+    l = df_1m["low"].resample("5min").min()
+    c = df_1m["close"].resample("5min").last()
+    v = df_1m["volume"].resample("5min").sum()
+    out = pd.concat([o,h,l,c,v], axis=1).dropna()
+    out.columns = ["open","high","low","close","volume"]
     return out
 
-
-# =============================
-# SIMPLE NEWS SENTIMENT (no extra libs)
-# =============================
-POS_WORDS = {
-    "beat", "beats", "surge", "surges", "soar", "soars", "record", "strong", "upgrade",
-    "bull", "bullish", "growth", "wins", "win", "positive", "buy", "rebound", "raises"
-}
-NEG_WORDS = {
-    "miss", "misses", "drop", "drops", "plunge", "plunges", "weak", "downgrade",
-    "bear", "bearish", "lawsuit", "cuts", "cut", "negative", "sell", "fraud", "halt"
-}
-
-
-def score_headline_sentiment(headline: str) -> float:
-    """
-    Returns -1..+1
-    """
-    if not headline:
-        return 0.0
-    text = headline.lower()
-    pos = sum(1 for w in POS_WORDS if w in text)
-    neg = sum(1 for w in NEG_WORDS if w in text)
-    if pos == 0 and neg == 0:
-        return 0.0
-    return (pos - neg) / (pos + neg)
-
-
-def news_dataframe(items: list[dict], ticker: str) -> pd.DataFrame:
-    rows = []
-    for it in items:
-        title = it.get("title", "") or ""
-        url = it.get("article_url", "") or ""
-        source = (it.get("publisher", {}) or {}).get("name", "") or ""
-        published = it.get("published_utc", "") or ""
-        s = score_headline_sentiment(title)
-        rows.append({
-            "Ticker": ticker,
-            "Published_UTC": published,
-            "Sentiment": round(s, 2),
-            "Title": title,
-            "Source": source,
-            "URL": url
-        })
-    return pd.DataFrame(rows)
-
-
-# =============================
-# SCORE + SIGNALS
-# =============================
-def compute_features(df: pd.DataFrame) -> dict:
-    """
-    df: minute bars
-    Returns latest indicator values for scoring.
-    """
-    if df.empty or len(df) < 50:
-        return {}
-
-    close = df["close"]
-    vol = df["volume"]
-
-    r = rsi(close, 14).iloc[-1]
-
-    macd_line, signal_line, hist = macd(close)
-    macd_hist = hist.iloc[-1]
-
-    ema20 = ema(close, 20).iloc[-1]
-    ema50 = ema(close, 50).iloc[-1]
-    trend_up = 1 if ema20 > ema50 else 0
-
-    # Volume spike = last 5m avg / prior 30m avg
-    last_5 = vol.tail(5).mean()
-    prev_30 = vol.tail(35).head(30).mean() if len(vol) >= 35 else vol.mean()
-    vol_spike = (last_5 / prev_30) if prev_30 and not math.isnan(prev_30) else 1.0
-
-    # Range spike = last 5m avg range / prior 30m avg range
-    rng = (df["high"] - df["low"])
-    last_5_rng = rng.tail(5).mean()
-    prev_30_rng = rng.tail(35).head(30).mean() if len(rng) >= 35 else rng.mean()
-    range_spike = (last_5_rng / prev_30_rng) if prev_30_rng and not math.isnan(prev_30_rng) else 1.0
-
-    return {
-        "rsi": float(r),
-        "macd_hist": float(macd_hist),
-        "trend_up": int(trend_up),
-        "vol_spike": float(vol_spike),
-        "range_spike": float(range_spike),
-        "last_close": float(close.iloc[-1]),
+# -----------------------------
+# Polygon: News (cached)
+# -----------------------------
+@st.cache_data(ttl=120)
+def polygon_news(ticker: str, minutes_back: int):
+    if not POLYGON_API_KEY:
+        return []
+    since = utc_now() - timedelta(minutes=minutes_back)
+    url = "https://api.polygon.io/v2/reference/news"
+    params = {
+        "ticker": ticker,
+        "published_utc.gte": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 10,
+        "order":"desc",
+        "sort":"published_utc",
+        "apiKey": POLYGON_API_KEY
     }
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code == 429:
+        return [{"_rate_limited": True}]
+    r.raise_for_status()
+    return r.json().get("results", []) or []
 
+POS = {"beat","beats","surge","soar","upgrade","upgraded","strong","bull","bullish","profit","approval","approved","record"}
+NEG = {"miss","misses","drop","plunge","downgrade","lawsuit","probe","fraud","weak","bear","bearish","loss","halt","recall"}
 
-def to_0_1(x, lo, hi):
-    if hi == lo:
-        return 0.5
-    return clamp((x - lo) / (hi - lo), 0.0, 1.0)
+def headline_sentiment(title: str) -> float:
+    if not title:
+        return 0.0
+    t = title.lower()
+    p = sum(1 for w in POS if w in t)
+    n = sum(1 for w in NEG if w in t)
+    if p+n == 0:
+        return 0.0
+    return (p-n)/(p+n)
 
+# -----------------------------
+# Unusual Whales: Flow Alerts (list) + Contract Flow drilldown
+# -----------------------------
+def uw_headers():
+    if not UW_API_KEY:
+        raise RuntimeError("Missing UNUSUAL_WHALES_API_KEY in Secrets")
+    return {"Authorization": f"Bearer {UW_API_KEY}", "Accept": "application/json, text/plain"}
 
-def compute_score(features: dict, news_sent: float, weights: dict) -> tuple[int, str, str, str]:
+@st.cache_data(ttl=20)
+def uw_flow_alerts():
     """
-    Returns:
-      score 0..100,
-      bias ("Bullish"/"Bearish"/"Neutral"),
-      signal ("BUY"/"SELL"/"WAIT"),
-      unusual_alert ("YES"/"NO")
+    This must be a LIST endpoint (flow alerts / option trades alerts).
+    Put its full URL in UW_FLOW_ALERTS_URL secret.
     """
-    if not features:
-        return 0, "Neutral", "WAIT", "NO"
+    if not UW_FLOW_ALERTS_URL:
+        return None
+    r = requests.get(UW_FLOW_ALERTS_URL, headers=uw_headers(), timeout=20)
+    if r.status_code == 429:
+        return {"_rate_limited": True}
+    r.raise_for_status()
+    return r.json()
 
-    # RSI: prefer 30-70 neutral; bullish if rising from low; bearish if high
-    rsi_val = features["rsi"]
-    rsi_bull = to_0_1(70 - rsi_val, 0, 40)  # higher when RSI is lower (oversold)
-    rsi_bear = to_0_1(rsi_val - 30, 0, 40)  # higher when RSI is higher (overbought)
-    rsi_component = (rsi_bull - rsi_bear)  # -1..+1-ish
+@st.cache_data(ttl=60)
+def uw_contract_flow(contract_id: str):
+    url = UW_CONTRACT_FLOW_URL.replace("{id}", contract_id)
+    r = requests.get(url, headers=uw_headers(), timeout=20)
+    if r.status_code == 429:
+        return {"_rate_limited": True}
+    r.raise_for_status()
+    return r.json()
 
-    # MACD hist: positive bullish, negative bearish
-    macd_component = clamp(features["macd_hist"] / 0.5, -1.0, 1.0)  # scaled
+# -----------------------------
+# Scoring (0-100) + BUY/SELL
+# -----------------------------
+def compute_score(df5: pd.DataFrame, news_items: list, flow_hit: bool,
+                  w_rsi=0.25, w_macd=0.25, w_trend=0.20, w_vol=0.20, w_news=0.10):
+    if df5.empty or len(df5) < 30:
+        return {"score": 0, "bias":"Neutral", "signal":"WAIT", "rsi":None, "macd_hist":None, "vol_spike":None, "news":0.0}
 
-    # Trend: +1 if up, -1 if down
-    trend_component = 1.0 if features["trend_up"] == 1 else -1.0
+    close = df5["close"].astype(float)
+    vol = df5["volume"].astype(float)
 
-    # Volume/Range spikes -> "unusual activity"
-    vol_spike = features["vol_spike"]
-    range_spike = features["range_spike"]
-    unusual = (vol_spike >= 2.0) or (range_spike >= 2.0)
-    unusual_component = 1.0 if unusual else 0.0
+    r = float(rsi(close, 14).iloc[-1])
+    _, _, hist = macd(close)
+    mh = float(hist.iloc[-1])
 
-    # News sentiment already -1..+1
-    news_component = clamp(news_sent, -1.0, 1.0)
+    ema20 = float(ema(close, 20).iloc[-1])
+    ema50 = float(ema(close, 50).iloc[-1]) if len(close) >= 50 else float(ema(close, 30).iloc[-1])
+    trend_ok = ema20 > ema50
 
-    # Weighted sum in -1..+1 range-ish
-    w_sum = (
-        weights["rsi"] * rsi_component +
-        weights["macd"] * macd_component +
-        weights["trend"] * trend_component +
-        weights["unusual"] * unusual_component +
-        weights["news"] * news_component
-    )
+    vol_med = float(np.median(vol.values)) if len(vol) else 0.0
+    vol_last = float(vol.iloc[-1]) if len(vol) else 0.0
+    vol_spike = (vol_last / vol_med) if vol_med > 0 else 1.0
 
-    # Map to 0..100
-    score = int(round(clamp(50 + (w_sum * 50), 0, 100)))
+    # news sentiment
+    news_sent = 0.0
+    if news_items and not (isinstance(news_items, list) and news_items and news_items[0].get("_rate_limited")):
+        s = [headline_sentiment(x.get("title","")) for x in news_items]
+        news_sent = float(np.mean(s)) if s else 0.0
 
-    if score >= 65:
-        bias = "Bullish"
-    elif score <= 35:
-        bias = "Bearish"
-    else:
-        bias = "Neutral"
+    # normalize components to 0..1 bullish
+    if r <= 30: rsi_comp = 1.0
+    elif r >= 70: rsi_comp = 0.0
+    else: rsi_comp = (70 - r) / 40.0
 
-    # Simple signal rules (you can tighten later)
-    if score >= 75 and features["trend_up"] == 1:
+    macd_comp = 0.5 + max(-0.5, min(0.5, mh * 5))
+    trend_comp = 0.75 if trend_ok else 0.25
+    vol_comp = max(0.0, min(1.0, (vol_spike - 1.0) / 2.0))  # 3x => 1.0
+    news_comp = 0.5 + max(-0.5, min(0.5, news_sent))
+
+    total = w_rsi + w_macd + w_trend + w_vol + w_news
+    bull = (w_rsi*rsi_comp + w_macd*macd_comp + w_trend*trend_comp + w_vol*vol_comp + w_news*news_comp) / (total or 1.0)
+
+    # small boost if UW flow triggered
+    if flow_hit:
+        bull = min(1.0, bull + 0.08)
+
+    score = int(round(bull * 100))
+    bias = "Bullish" if score >= 60 else ("Bearish" if score <= 40 else "Neutral")
+
+    # signals (tuned for 5m trading)
+    if score >= 75 and trend_ok and mh > 0:
         signal = "BUY"
-    elif score <= 25 and features["trend_up"] == 0:
+    elif score <= 25 and (not trend_ok) and mh < 0:
         signal = "SELL"
     else:
         signal = "WAIT"
 
-    unusual_alert = "YES" if unusual else "NO"
-    return score, bias, signal, unusual_alert
+    return {
+        "score": score,
+        "bias": bias,
+        "signal": signal,
+        "rsi": round(r, 1),
+        "macd_hist": round(mh, 4),
+        "vol_spike": round(vol_spike, 2),
+        "news": round(news_sent, 2),
+    }
 
-
-# =============================
+# -----------------------------
 # UI
-# =============================
-st.title("📈 Option Flow (Unusual Whales) + 🗞️ News (Polygon) + Live Score/Signals")
+# -----------------------------
+st.title("📈 5m Live Score + 🐋 Unusual Whales Flow + 🗞️ News")
 
 with st.sidebar:
     st.header("Settings")
-
-    tickers = st.multiselect("Tickers", DEFAULT_TICKERS, default=["SPY", "QQQ", "DIA", "IWM"])
-    news_minutes = st.number_input("News lookback (minutes)", 1, 240, 5, 1)
-    bars_minutes = st.number_input("Price window (minutes)", 30, 600, 180, 30)
-
-    st.divider()
-    st.subheader("Refresh")
-    refresh_seconds = st.slider("Auto-refresh (seconds)", 30, 300, 60, 10)
-    st.caption("Tip: If you see 429 Too Many Requests, increase refresh seconds or reduce tickers.")
+    tickers = st.multiselect("Tickers", DEFAULT_TICKERS, default=["SPY","QQQ","DIA","IWM"])
+    price_minutes = st.number_input("Price lookback (minutes)", 60, 1000, 390, 15)  # ~1 trading day
+    news_minutes = st.number_input("News lookback (minutes)", 5, 240, 60, 5)
+    refresh = st.slider("Auto-refresh (seconds)", 30, 600, 120, 30)
 
     st.divider()
-    st.subheader("Polygon API Key")
-    if POLYGON_API_KEY:
-        st.success("Polygon key loaded ✅")
-    else:
-        st.error("Polygon key missing. Add it in Streamlit → Manage app → Settings → Secrets as POLYGON_API_KEY")
+    st.subheader("Status")
+    st.write("Polygon key:", "✅" if POLYGON_API_KEY else "❌")
+    st.write("UW key:", "✅" if UW_API_KEY else "❌")
+    st.write("UW Flow Alerts URL:", "✅" if UW_FLOW_ALERTS_URL else "❌ (add UW_FLOW_ALERTS_URL in Secrets)")
 
-    st.divider()
-    st.subheader("Scoring weights (total doesn’t have to = 1)")
-    w_rsi = st.slider("RSI weight", 0.0, 1.0, 0.25, 0.05)
-    w_macd = st.slider("MACD weight", 0.0, 1.0, 0.20, 0.05)
-    w_trend = st.slider("Trend (EMA20/50) weight", 0.0, 1.0, 0.20, 0.05)
-    w_unusual = st.slider("Unusual activity weight", 0.0, 1.0, 0.20, 0.05)
-    w_news = st.slider("News sentiment weight", 0.0, 1.0, 0.15, 0.05)
+st_autorefresh(interval=int(refresh*1000), key="refresh")
 
-    weights = {"rsi": w_rsi, "macd": w_macd, "trend": w_trend, "unusual": w_unusual, "news": w_news}
-
-# Auto refresh
-st_autorefresh(interval=int(refresh_seconds * 1000), key="autorefresh")
-
-col1, col2 = st.columns([1.15, 1])
+col1, col2 = st.columns([1.2, 1])
 
 with col1:
-    st.subheader("Unusual Whales — your screener")
-    st.write("This is embedded. For true flow alerts, set alerts inside Unusual Whales (their platform).")
-    st.components.v1.iframe(UW_SCREENER_URL, height=900, scrolling=True)
+    st.subheader("Unusual Whales Screener (web view)")
+    st.components.v1.iframe(UW_SCREENER_URL, height=850, scrolling=True)
 
 with col2:
-    st.subheader("Live Score / Signals (Polygon price + headlines)")
-    st.write(f"Last update (UTC): **{utc_now().strftime('%Y-%m-%d %H:%M:%S')}**")
+    st.subheader("Scores / Signals (5m)")
+    st.write(f"Updated (UTC): **{utc_now().strftime('%Y-%m-%d %H:%M:%S')}**")
 
-    if not tickers:
-        st.info("Pick at least 1 ticker in the sidebar.")
-        st.stop()
+    # Fetch flow alerts list once
+    flow_json = uw_flow_alerts()
+    flow_rate_limited = isinstance(flow_json, dict) and flow_json.get("_rate_limited")
 
-    # Build score table
+    # Build a quick “ticker hit” map from flow alerts json (structure varies by endpoint)
+    flow_hits = {t: False for t in tickers}
+    contract_ids_by_ticker = {t: [] for t in tickers}
+
+    if flow_json and not flow_rate_limited:
+        # Try to find records in common keys
+        records = None
+        if isinstance(flow_json, dict):
+            records = flow_json.get("data") or flow_json.get("results") or flow_json.get("alerts")
+        elif isinstance(flow_json, list):
+            records = flow_json
+
+        if isinstance(records, list):
+            for r in records:
+                sym = r.get("underlying_symbol") or r.get("ticker") or r.get("symbol")
+                cid = r.get("id") or r.get("option_contract_id") or r.get("contract_id")
+                if sym in flow_hits:
+                    flow_hits[sym] = True
+                    if cid:
+                        contract_ids_by_ticker[sym].append(cid)
+
     rows = []
-    all_news_frames = []
-
     for t in tickers:
         try:
-            bars = polygon_minute_bars(t, int(bars_minutes), POLYGON_API_KEY)
-            feats = compute_features(bars)
+            df1 = polygon_1m_bars(t, int(price_minutes))
+            df5 = to_5m(df1)
 
-            news_items = polygon_news(t, int(news_minutes), POLYGON_API_KEY)
-            ndf = news_dataframe(news_items, t)
-            if not ndf.empty:
-                all_news_frames.append(ndf)
+            news = polygon_news(t, int(news_minutes))
+            flow_hit = bool(flow_hits.get(t, False))
 
-            # Average sentiment over window
-            news_sent = float(ndf["Sentiment"].mean()) if (not ndf.empty and "Sentiment" in ndf.columns) else 0.0
-
-            score, bias, signal, unusual_alert = compute_score(feats, news_sent, weights)
+            out = compute_score(df5, news, flow_hit)
 
             rows.append({
                 "Ticker": t,
-                "Score": score,
-                "Bias": bias,
-                "Signal": signal,
-                "Unusual Alert": unusual_alert,
-                "RSI": round(feats.get("rsi", float("nan")), 2) if feats else None,
-                "Vol Spike": round(feats.get("vol_spike", float("nan")), 2) if feats else None,
-                "Range Spike": round(feats.get("range_spike", float("nan")), 2) if feats else None,
+                "Score": out["score"],
+                "Bias": out["bias"],
+                "Signal": out["signal"],
+                "UW Flow Trigger": "YES" if flow_hit else ("429" if flow_rate_limited else "NO"),
+                "RSI14": out["rsi"],
+                "MACD_hist": out["macd_hist"],
+                "VolSpike": out["vol_spike"],
+                "NewsSent": out["news"],
             })
 
-        except requests.HTTPError as e:
-            # show cleaner error
-            rows.append({"Ticker": t, "Score": 0, "Bias": "Error", "Signal": "WAIT", "Unusual Alert": "NO"})
-        except Exception:
-            rows.append({"Ticker": t, "Score": 0, "Bias": "Error", "Signal": "WAIT", "Unusual Alert": "NO"})
+            time.sleep(0.15)  # gentle rate limiting
+        except Exception as e:
+            rows.append({"Ticker": t, "Score":"ERR", "Bias":"", "Signal":"", "UW Flow Trigger":"", "RSI14":"", "MACD_hist":"", "VolSpike":"", "NewsSent":"", "Error": str(e)})
 
-    score_df = pd.DataFrame(rows)
-    st.dataframe(score_df, use_container_width=True, hide_index=True)
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("Alerts (simple)")
-    alerts = score_df[(score_df["Signal"].isin(["BUY", "SELL"])) | (score_df["Unusual Alert"] == "YES")]
-    if alerts.empty:
-        st.info("No BUY/SELL or unusual activity spikes right now.")
+    st.subheader("UW Contract Flow Drilldown (optional)")
+    st.caption("Pick a ticker → then pick a contract id → see the last trades for that contract.")
+    t_pick = st.selectbox("Ticker", tickers if tickers else ["SPY"])
+    cands = contract_ids_by_ticker.get(t_pick, [])
+    if not UW_FLOW_ALERTS_URL:
+        st.info("Add UW_FLOW_ALERTS_URL in Secrets to populate contract IDs automatically.")
+    elif not cands:
+        st.info("No contract IDs found from your flow-alerts endpoint response yet.")
     else:
-        for _, r in alerts.iterrows():
-            st.warning(f"{r['Ticker']} — Signal: {r['Signal']} | Score: {r['Score']} | Unusual: {r['Unusual Alert']}")
+        cid = st.selectbox("Contract ID", cands[:25])
+        if st.button("Load contract flow"):
+            try:
+                cf = uw_contract_flow(cid)
+                st.json(cf)
+            except Exception as e:
+                st.error(str(e))
 
     st.divider()
-    st.subheader(f"Polygon News — last {int(news_minutes)} minutes")
-    if not all_news_frames:
-        st.info("No news in the last window (or Polygon key missing / rate-limited).")
-    else:
-        news_df = pd.concat(all_news_frames, ignore_index=True)
-        st.dataframe(news_df, use_container_width=True, hide_index=True)
-
-        st.subheader("Clickable links")
-        for _, row in news_df.iterrows():
-            title = row.get("Title", "") or "(no title)"
-            url = row.get("URL", "") or ""
+    st.subheader("News (clickable)")
+    for t in tickers:
+        items = polygon_news(t, int(news_minutes))
+        if isinstance(items, list) and items and items[0].get("_rate_limited"):
+            st.warning(f"{t}: Polygon news rate-limited (429). Increase refresh seconds.")
+            continue
+        for it in (items or [])[:5]:
+            title = it.get("title","(no title)")
+            url = it.get("article_url","")
             if url:
-                st.markdown(f"- **{row['Ticker']}** — [{title}]({url})")
+                st.markdown(f"- **{t}** — [{title}]({url})")
 
