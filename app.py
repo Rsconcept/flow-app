@@ -34,50 +34,32 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def polygon_fetch_news(ticker: str, minutes: int = 5, limit: int = 50) -> list[dict]:
-    """
-    Pull Polygon news for a ticker in the last X minutes.
-    Uses Polygon endpoint: /v2/reference/news
-    """
-    if not POLYGON_API_KEY:
-        return []
-
-    start = utc_now() - timedelta(minutes=minutes)
-    start_iso = start.isoformat().replace("+00:00", "Z")
-
+@st.cache_data(ttl=60)
+def get_polygon_news(ticker: str, api_key: str):
     url = "https://api.polygon.io/v2/reference/news"
     params = {
         "ticker": ticker,
-        "published_utc.gte": start_iso,
-        "limit": limit,
+        "limit": 20,
         "order": "desc",
         "sort": "published_utc",
-        "apiKey": POLYGON_API_KEY,
+        "apiKey": api_key,
     }
 
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("results", []) or []
+    try:
+        r = requests.get(url, params=params, timeout=20)
 
+        if r.status_code == 429:
+            st.warning("Polygon rate limit hit. Waiting before retry.")
+            return []
 
-def normalize_news(items: list[dict], ticker: str) -> pd.DataFrame:
-    rows = []
-    for it in items:
-        rows.append(
-            {
-                "Ticker": ticker,
-                "Published (UTC)": it.get("published_utc", ""),
-                "Title": it.get("title", ""),
-                "Source": (it.get("publisher", {}) or {}).get("name", ""),
-                "URL": it.get("article_url", ""),
-            }
-        )
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        # Sort newest first
-        df = df.sort_values(by="Published (UTC)", ascending=False)
-    return df
+        r.raise_for_status()
+        data = r.json()
+        return data.get("results", []) or []
+
+    except Exception as e:
+        st.error(f"Polygon error: {e}")
+        return []
+
 
 
 # -----------------------------
