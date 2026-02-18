@@ -1,43 +1,650 @@
 import os
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+
 from streamlit_autorefresh import st_autorefresh
 
-# Python 3.9+ (Streamlit Cloud is fine)
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+
+# =========================
+#   PAGE CONFIG
+# =========================
+st.set_page_config(page_title="Institutional Options Signals (5m) — CALLS / PUTS ONLY", layout="wide")
+
+CST = ZoneInfo("America/Chicago")
+UTC = ZoneInfo("UTC")
 
 
-# =========================================================
-# TIMEZONE (CST)
-# =========================================================
-CHI_TZ = ZoneInfo("America/Chicago") if ZoneInfo else None
+# =========================
+#   SECRETS / KEYS
+# =========================
+def _secret(name: str) -> str:
+    return str(st.secrets.get(name, os.getenv(name, "")) or "").strip()
+
+EODHD_API_KEY      = _secret("EODHD_API_KEY")
+UW_TOKEN           = _secret("UW_TOKEN")
+UW_FLOW_ALERTS_URL = _secret("UW_FLOW_ALERTS_URL")  # should be https://api.unusualwhales.com/api/option-trade/flow-alerts
+FINVIZ_AUTH        = _secret("FINVIZ_AUTH")         # optional (not required in this build)
+POLYGON_API_KEY    = _secret("POLYGON_API_KEY")     # optional (not required in this build)
+
+DEFAULT_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "TSLA", "AMD", "NVDA"]
 
 
-def now_cst() -> datetime:
-    if CHI_TZ:
-        return datetime.now(CHI_TZ)
-    # fallback (approx CST) if zoneinfo missing
-    return datetime.now(timezone.utc) - timedelta(hours=6)
+# =========================
+#   SAFE REQUEST
+# =========================
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "streamlit-app/1.0"})
 
+def safe_get(url, *, params=None, headers=None, timeout=20):
+    r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+    return r
+
+
+def now_cst():
+    return datetime.now(tz=CST)
 
 def fmt_cst(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.astimezone(CST).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-# =========================================================
-# CONFIG
-# =========================================================
-st.set_page_config(page_title="Institutional Options Signals", layout="wide")
+# =========================
+#   INDICATORS
+# =========================
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-DEFAULT_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "TSLA", "NVDA", "AMD"]
+def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, 1e-12))
+    return 100 - (100 / (1 + rs))
 
+def macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line - signal_line
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    # VWAP using typical price * volume cumulative
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    pv = tp * df["volume"]
+    cum_pv = pv.cumsum()
+    cum_v = df["volume"].cumsum().replace(0, 1e-12)
+    return cum_pv / cum_v
+
+
+# =========================
+#   EODHD: intraday + news
+# =========================
+def ensure_us_symbol(ticker: str) -> str:
+    t = (ticker or "").upper().strip()
+    # If user already typed ".US" or something, keep it.
+    if "." in t:
+        return t
+    return f"{t}.US"
+
+@st.cache_data(ttl=25, show_spinner=False)
+def eodhd_intraday(symbol_us: str, interval: str = "5m", lookback_minutes: int = 240):
+    """
+    Returns DataFrame with columns: datetime, open, high, low, close, volume (CST-localized).
+    """
+    if not EODHD_API_KEY:
+        return None, "missing_key"
+
+    # EODHD intraday endpoint
+    url = f"https://eodhd.com/api/intraday/{symbol_us}"
+    # We use 'from' to reduce payload. Buffer a bit.
+    start_utc = datetime.now(tz=UTC) - timedelta(minutes=lookback_minutes + 30)
+    params = {
+        "api_token": EODHD_API_KEY,
+        "interval": interval,
+        "fmt": "json",
+        "from": start_utc.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    try:
+        r = safe_get(url, params=params, timeout=25)
+        if r.status_code != 200:
+            return None, f"http_{r.status_code}"
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return None, "empty"
+
+        df = pd.DataFrame(data)
+        # EODHD returns "datetime" in UTC-like string
+        if "datetime" not in df.columns:
+            return None, "bad_schema"
+
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+        df = df.dropna(subset=["datetime"]).sort_values("datetime")
+        df["datetime"] = df["datetime"].dt.tz_convert(CST)
+
+        # Ensure numeric
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["close", "volume"])
+
+        # Trim to lookback
+        cutoff = now_cst() - timedelta(minutes=lookback_minutes)
+        df = df[df["datetime"] >= cutoff]
+        if len(df) < 30:
+            # Not enough bars for indicators
+            return df, "few_bars"
+
+        return df, "ok"
+    except Exception:
+        return None, "exception"
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def eodhd_news(symbol_us: str, lookback_minutes: int = 60):
+    """
+    EODHD news endpoint: https://eodhd.com/api/news?s=AAPL.US&from=YYYY-MM-DD&api_token=...
+    """
+    if not EODHD_API_KEY:
+        return None, "missing_key"
+
+    from_dt = (now_cst() - timedelta(minutes=lookback_minutes)).date().isoformat()
+    url = "https://eodhd.com/api/news"
+    params = {
+        "api_token": EODHD_API_KEY,
+        "s": symbol_us,
+        "from": from_dt,
+        "limit": 50,
+        "fmt": "json",
+    }
+
+    try:
+        r = safe_get(url, params=params, timeout=25)
+        if r.status_code != 200:
+            return None, f"http_{r.status_code}"
+        data = r.json()
+        if not isinstance(data, list):
+            return None, "bad_schema"
+        if len(data) == 0:
+            return [], "empty"
+
+        df = pd.DataFrame(data)
+        # Normalize time
+        if "date" in df.columns:
+            df["published"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_convert(CST)
+        elif "published_at" in df.columns:
+            df["published"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True).dt.tz_convert(CST)
+        else:
+            df["published"] = pd.NaT
+
+        df = df.sort_values("published", ascending=False)
+
+        # Filter to lookback minutes
+        cutoff = now_cst() - timedelta(minutes=lookback_minutes)
+        df = df[df["published"].notna() & (df["published"] >= cutoff)]
+
+        out = []
+        for _, row in df.iterrows():
+            title = str(row.get("title", "") or "")
+            src = str(row.get("source", "") or "")
+            url_ = str(row.get("link", "") or row.get("url", "") or "")
+            published = row.get("published")
+            out.append({
+                "Ticker": symbol_us.replace(".US", ""),
+                "Published (CST)": published.strftime("%Y-%m-%d %H:%M:%S") if isinstance(published, pd.Timestamp) else "",
+                "Source": src,
+                "Title": title,
+                "URL": url_
+            })
+
+        return out, "ok"
+    except Exception:
+        return None, "exception"
+
+
+# =========================
+#   UNUSUAL WHALES: options-volume + flow-alerts
+# =========================
+@st.cache_data(ttl=25, show_spinner=False)
+def uw_options_volume_bias(ticker: str):
+    """
+    Correct endpoint:
+    https://api.unusualwhales.com/api/stock/{ticker}/options-volume
+    Returns bias info or None.
+    """
+    if not UW_TOKEN:
+        return None, "missing_key"
+
+    url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-volume"
+    headers = {
+        "Accept": "application/json, text/plain",
+        "Authorization": f"Bearer {UW_TOKEN}",
+    }
+    try:
+        r = safe_get(url, headers=headers, timeout=25)
+        if r.status_code != 200:
+            return None, f"http_{r.status_code}"
+        data = r.json()
+        rows = data.get("data", [])
+        if not rows:
+            return None, "empty"
+
+        row = rows[0]
+        # Put/call premium + volumes
+        call_vol = float(row.get("call_volume") or 0)
+        put_vol = float(row.get("put_volume") or 0)
+        call_prem = float(row.get("call_premium") or 0)
+        put_prem = float(row.get("put_premium") or 0)
+
+        # Bias (simple)
+        vol_bias = "CALL" if call_vol > put_vol else ("PUT" if put_vol > call_vol else "NEUTRAL")
+        prem_bias = "CALL" if call_prem > put_prem else ("PUT" if put_prem > call_prem else "NEUTRAL")
+
+        return {
+            "call_volume": call_vol,
+            "put_volume": put_vol,
+            "call_premium": call_prem,
+            "put_premium": put_prem,
+            "vol_bias": vol_bias,
+            "prem_bias": prem_bias,
+        }, "ok"
+    except Exception:
+        return None, "exception"
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def uw_flow_alerts(limit: int = 300):
+    """
+    Correct endpoint (from docs):
+    https://api.unusualwhales.com/api/option-trade/flow-alerts
+
+    IMPORTANT: must use Authorization: Bearer <token>
+
+    Returns list of flow alerts or None.
+    """
+    if not UW_TOKEN:
+        return None, "missing_key"
+
+    # If user did not put URL, fall back to correct default:
+    base = UW_FLOW_ALERTS_URL or "https://api.unusualwhales.com/api/option-trade/flow-alerts"
+    headers = {
+        "Accept": "application/json, text/plain",
+        "Authorization": f"Bearer {UW_TOKEN}",
+    }
+    params = {"limit": int(limit)}
+
+    try:
+        r = safe_get(base, params=params, headers=headers, timeout=25)
+        if r.status_code != 200:
+            return None, f"http_{r.status_code}"
+
+        data = r.json()
+        items = data.get("data", data if isinstance(data, list) else [])
+        if not isinstance(items, list):
+            return None, "bad_schema"
+
+        return items, "ok"
+    except Exception:
+        return None, "exception"
+
+
+def filter_flow_alerts(items, *, min_premium=1_000_000, max_dte=3, require_vol_gt_oi=True, exclude_itm=True):
+    """
+    Best-effort filtering based on fields that may exist.
+    We do not crash if schema differs.
+    """
+    out = []
+    for it in items or []:
+        try:
+            prem = float(it.get("premium") or 0)
+            dte = it.get("dte")
+            if dte is None:
+                # sometimes you can infer from expiry
+                expiry = it.get("expiry")
+                if expiry:
+                    exp = datetime.fromisoformat(str(expiry)).replace(tzinfo=None)
+                    dte = (exp.date() - now_cst().date()).days
+            dte = int(dte) if dte is not None else 999
+
+            oi = float(it.get("open_interest") or 0)
+            vol = float(it.get("volume") or 0)
+            # itm detection often not provided; tags sometimes include it
+            tags = it.get("tags") or []
+            tags_str = " ".join(tags).lower() if isinstance(tags, list) else str(tags).lower()
+            is_itm = ("itm" in tags_str) or ("in_the_money" in tags_str)
+
+            if prem < min_premium:
+                continue
+            if dte > max_dte:
+                continue
+            if require_vol_gt_oi and not (vol > oi and oi > 0):
+                continue
+            if exclude_itm and is_itm:
+                continue
+
+            # Stock/ETF only: best-effort via issue/industry fields if present
+            out.append(it)
+        except Exception:
+            continue
+    return out
+
+
+# =========================
+#   10Y YIELD (optional)
+# =========================
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_10y_yield_optional():
+    """
+    Optional best-effort 10Y yield (won't break app if unavailable).
+    Uses a public Stooq CSV as a lightweight source (no key).
+    """
+    try:
+        # Stooq symbol often works like "us10y" (not guaranteed).
+        url = "https://stooq.com/q/l/?s=us10y&i=d"
+        r = safe_get(url, timeout=15)
+        if r.status_code != 200:
+            return None, "http"
+        text = r.text.strip().splitlines()
+        if len(text) < 2:
+            return None, "empty"
+        # CSV: Symbol,Date,Open,High,Low,Close,Volume
+        parts = text[1].split(",")
+        if len(parts) < 6:
+            return None, "bad"
+        close = float(parts[5])
+        return close, "ok"
+    except Exception:
+        return None, "exception"
+
+
+# =========================
+#   SCORING / SIGNALS
+# =========================
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+def score_to_confidence(bull_score_0_1: float) -> int:
+    # Convert 0..1 to 0..100
+    return int(round(100 * clamp01(bull_score_0_1)))
+
+def build_signal_row(ticker: str, df: pd.DataFrame, uw_bias: dict | None, flow_for_ticker: list, y10: float | None,
+                     weights: dict, institutional_cutoff: int):
+    """
+    Produces a CALLS/PUTS-only signal with confidence 0-100.
+    """
+
+    # If we can't compute indicators, return stable row
+    if df is None or len(df) < 30:
+        return {
+            "Ticker": ticker,
+            "Confidence": 50,
+            "Direction": "—",
+            "Signal": "WAIT",
+            "UW Unusual": "NO",
+            "UW Bias": (uw_bias.get("prem_bias") if uw_bias else "N/A"),
+            "IV spike": "N/A",
+            "Gamma bias": "N/A",
+            "RSI": None,
+            "MACD_hist": None,
+            "VWAP": None,
+            "EMA stack": None,
+            "Vol_ratio": None,
+            "10Y": (f"{y10:.2f}" if isinstance(y10, (int, float)) else "N/A"),
+        }
+
+    close = df["close"].copy()
+    vol = df["volume"].copy()
+
+    rsi14 = rsi(close, 14).iloc[-1]
+    macdh = macd_hist(close).iloc[-1]
+
+    vwap_series = vwap(df)
+    vwap_last = float(vwap_series.iloc[-1])
+    price_last = float(close.iloc[-1])
+
+    ema9 = float(ema(close, 9).iloc[-1])
+    ema20 = float(ema(close, 20).iloc[-1])
+    ema50 = float(ema(close, 50).iloc[-1])
+
+    # Volume ratio: last bar vs 20-bar average
+    vol_avg = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
+    vol_ratio = (float(vol.iloc[-1]) / (vol_avg if vol_avg > 0 else 1e-9))
+
+    # EMA stack label
+    if ema9 > ema20 > ema50:
+        ema_stack = "Bull"
+    elif ema9 < ema20 < ema50:
+        ema_stack = "Bear"
+    else:
+        ema_stack = "Mixed"
+
+    # VWAP above/below
+    vwap_pos = "Above" if price_last >= vwap_last else "Below"
+
+    # --- UW flow: determine unusual + IV spike + gamma proxy ---
+    unusual = "NO"
+    iv_spike = "None"
+    gamma_bias = "Neutral"
+
+    # If we have filtered flow alerts for this ticker, treat as "unusual"
+    if flow_for_ticker:
+        unusual = "YES"
+
+        # IV spike: compare max IV in recent alerts vs median
+        ivs = []
+        gammas = []
+        net_bull = 0
+        for it in flow_for_ticker:
+            try:
+                iv = float(it.get("implied_volatility") or 0)
+                if iv > 0:
+                    ivs.append(iv)
+                g = float(it.get("gamma") or 0)
+                if g != 0:
+                    gammas.append(g)
+
+                # Use tags to bias bullish/bearish
+                tags = it.get("tags") or []
+                tags_str = " ".join(tags).lower() if isinstance(tags, list) else str(tags).lower()
+                if "bullish" in tags_str:
+                    net_bull += 1
+                if "bearish" in tags_str:
+                    net_bull -= 1
+            except Exception:
+                continue
+
+        if ivs:
+            med = sorted(ivs)[len(ivs)//2]
+            mx = max(ivs)
+            # spike if max is 25% above median (tunable)
+            if med > 0 and mx / med >= 1.25:
+                iv_spike = "YES"
+            else:
+                iv_spike = "no"
+
+        # gamma proxy: sign of avg gamma + tag net
+        if gammas:
+            avg_g = sum(gammas)/len(gammas)
+            if avg_g > 0:
+                gamma_bias = "Positive (proxy)"
+            elif avg_g < 0:
+                gamma_bias = "Negative (proxy)"
+
+        if net_bull > 0:
+            gamma_bias = "Positive (proxy)"
+        elif net_bull < 0:
+            gamma_bias = "Negative (proxy)"
+
+    # --- UW options-volume bias ---
+    uw_bias_label = "N/A"
+    if uw_bias:
+        uw_bias_label = f"{uw_bias.get('prem_bias','N/A')} prem / {uw_bias.get('vol_bias','N/A')} vol"
+
+    # --- Optional 10Y yield filter: if yield spikes higher, slightly bearish risk-on intraday ---
+    y10_penalty = 0.0
+    if isinstance(y10, (int, float)):
+        # crude: treat >= 4.5 as slightly bearish (tunable); you can adjust later
+        if y10 >= 4.5:
+            y10_penalty = 0.05 * weights["y10"]
+
+    # --- Convert indicators into 0..1 bull signals ---
+    # RSI bull: 0 at 30-, 1 at 70+
+    rsi_bull = clamp01((rsi14 - 30.0) / 40.0)
+
+    # MACD bull: positive hist => bull, scaled
+    macd_bull = 0.5 + clamp01(macdh * 50.0) - 0.5  # small scale
+    macd_bull = clamp01(macd_bull)
+
+    # VWAP bull
+    vwap_bull = 1.0 if price_last >= vwap_last else 0.0
+
+    # EMA stack bull
+    ema_bull = 1.0 if ema_stack == "Bull" else (0.0 if ema_stack == "Bear" else 0.5)
+
+    # Volume bull (spike helps momentum)
+    vol_bull = clamp01((vol_ratio - 1.0) / 2.0)  # ratio 1 => 0, ratio 3 => 1
+
+    # UW flow bull
+    uw_flow_bull = 0.5
+    if unusual == "YES":
+        # If gamma bias positive, bull; negative, bear
+        if "Positive" in gamma_bias:
+            uw_flow_bull = 0.75
+        elif "Negative" in gamma_bias:
+            uw_flow_bull = 0.25
+        else:
+            uw_flow_bull = 0.6
+
+    # News bull is not "sentiment model" here; we just use presence of news as small factor
+    # (you can add real sentiment later)
+    news_bull = 0.5  # neutral placeholder
+
+    # Weighted bull score (0..1)
+    bull = (
+        weights["rsi"] * rsi_bull +
+        weights["macd"] * macd_bull +
+        weights["vwap"] * vwap_bull +
+        weights["ema"] * ema_bull +
+        weights["vol"] * vol_bull +
+        weights["uw"] * uw_flow_bull +
+        weights["news"] * news_bull
+    )
+
+    # Apply 10Y penalty (bearish tilt when high)
+    bull = clamp01(bull - y10_penalty)
+
+    confidence = score_to_confidence(bull)
+
+    # Direction (CALLS vs PUTS only)
+    direction = "CALLS" if bull >= 0.5 else "PUTS"
+
+    # Institutional mode: only fire BUY signal if confidence >= cutoff, otherwise WAIT
+    if confidence >= institutional_cutoff:
+        signal = f"BUY {direction}"
+    else:
+        signal = "WAIT"
+
+    # Make sure it NEVER returns "SELL" (options-only mode per your request)
+    row = {
+        "Ticker": ticker,
+        "Confidence": confidence,
+        "Direction": direction,
+        "Signal": signal,
+        "UW Unusual": unusual,
+        "UW Bias": uw_bias_label,
+        "IV spike": iv_spike,
+        "Gamma bias": gamma_bias,
+        "RSI": round(float(rsi14), 2) if pd.notna(rsi14) else None,
+        "MACD_hist": round(float(macdh), 5) if pd.notna(macdh) else None,
+        "VWAP": vwap_pos,
+        "EMA stack": ema_stack,
+        "Vol_ratio": round(float(vol_ratio), 2) if pd.notna(vol_ratio) else None,
+        "10Y": (round(float(y10), 2) if isinstance(y10, (int, float)) else "N/A"),
+    }
+    return row
+
+
+# =========================
+#   SIDEBAR: tickers (ANY ticker)
+# =========================
+st.title("🏛️ Institutional Options Signals (5m) — CALLS / PUTS ONLY")
+st.caption(f"Last update (CST): {fmt_cst(now_cst())}")
+
+with st.sidebar:
+    st.header("Settings")
+
+    # ANY ticker input
+    typed = st.text_input(
+        "Type tickers (comma-separated). Example: SPY,TSLA,NVDA",
+        value=",".join(DEFAULT_TICKERS[:4]),
+    )
+    typed_list = [t.strip().upper() for t in typed.split(",") if t.strip()]
+
+    # Also let user pick quickly from defaults (optional convenience)
+    picked = st.multiselect("Quick pick (optional)", DEFAULT_TICKERS, default=[])
+    tickers = []
+    for t in (typed_list + picked):
+        if t and t not in tickers:
+            tickers.append(t)
+
+    st.divider()
+    news_lookback = st.number_input("News lookback (minutes)", min_value=5, max_value=360, value=60, step=5)
+    price_lookback = st.number_input("Price lookback (minutes)", min_value=60, max_value=600, value=240, step=30)
+
+    st.divider()
+    st.subheader("Refresh")
+    refresh_sec = st.slider("Auto-refresh (seconds)", min_value=10, max_value=120, value=30, step=5)
+
+    st.divider()
+    st.subheader("Institutional mode")
+    institutional_cutoff = st.slider("Signals only if confidence ≥", min_value=50, max_value=95, value=75, step=1)
+
+    st.divider()
+    st.subheader("Weights (sum doesn't have to be 1)")
+    w_rsi  = st.slider("RSI weight", 0.0, 0.50, 0.15, 0.01)
+    w_macd = st.slider("MACD weight", 0.0, 0.50, 0.15, 0.01)
+    w_vwap = st.slider("VWAP weight", 0.0, 0.50, 0.15, 0.01)
+    w_ema  = st.slider("EMA stack (9/20/50) weight", 0.0, 0.50, 0.18, 0.01)
+    w_vol  = st.slider("Volume ratio weight", 0.0, 0.50, 0.12, 0.01)
+    w_uw   = st.slider("UW flow weight", 0.0, 0.80, 0.20, 0.01)
+    w_news = st.slider("News weight (placeholder)", 0.0, 0.30, 0.05, 0.01)
+    w_y10  = st.slider("10Y yield (optional) weight", 0.0, 0.30, 0.05, 0.01)
+
+    weights = {"rsi": w_rsi, "macd": w_macd, "vwap": w_vwap, "ema": w_ema, "vol": w_vol, "uw": w_uw, "news": w_news, "y10": w_y10}
+
+    st.divider()
+    st.subheader("Keys status (green/red)")
+
+    def key_badge(label, ok: bool):
+        if ok:
+            st.success(label)
+        else:
+            st.error(label)
+
+    key_badge("EODHD_API_KEY", bool(EODHD_API_KEY))
+    key_badge("UW_TOKEN (Bearer)", bool(UW_TOKEN))
+    key_badge("UW_FLOW_ALERTS_URL", bool(UW_FLOW_ALERTS_URL))
+
+    st.divider()
+    st.subheader("Endpoints status")
+    # We'll fill these after we run checks
+    endpoint_box = st.empty()
+
+
+# Auto refresh
+st_autorefresh(interval=int(refresh_sec) * 1000, key="auto_refresh")
+
+
+# =========================
+#   LEFT: UW Screener (web)
+# =========================
+# Your screener: filters (premium/DTE/ITM/volume>OI) are best enforced in screener UI itself.
 UW_SCREENER_URL = (
     "https://unusualwhales.com/options-screener"
     "?close_greater_avg=true&exclude_ex_div_ticker=true&exclude_itm=true"
@@ -49,814 +656,204 @@ UW_SCREENER_URL = (
     "&watchlist_name=GPT%20Filter%20"
 )
 
-# =========================================================
-# SECRETS
-# =========================================================
-EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", os.getenv("EODHD_API_KEY", "")).strip()
-UW_TOKEN = st.secrets.get("UW_TOKEN", os.getenv("UW_TOKEN", "")).strip()
+col_left, col_right = st.columns([1.25, 1.0], gap="large")
 
-# Default to correct UW endpoint (you posted this one)
-UW_FLOW_ALERTS_URL = st.secrets.get(
-    "UW_FLOW_ALERTS_URL",
-    os.getenv("UW_FLOW_ALERTS_URL", "https://api.unusualwhales.com/api/option-trade/flow-alerts"),
-).strip()
-
-# =========================================================
-# HELPERS (HTTP)
-# =========================================================
-UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-def http_get_json(url: str, headers=None, params=None, timeout=25):
-    h = dict(UA_HEADERS)
-    if headers:
-        h.update(headers)
-    r = requests.get(url, headers=h, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def safe_int(x, default=None):
-    try:
-        if x is None:
-            return default
-        return int(float(x))
-    except Exception:
-        return default
-
-
-# =========================================================
-# TECHNICALS (5m)
-# =========================================================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / (avg_loss.replace(0, math.nan))
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val.fillna(50)
-
-
-def macd_hist(close: pd.Series):
-    macd_line = ema(close, 12) - ema(close, 26)
-    signal = ema(macd_line, 9)
-    hist = macd_line - signal
-    return hist
-
-
-def vwap_from_ohlcv(df: pd.DataFrame) -> pd.Series:
-    # Typical price VWAP
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp * df["volume"]
-    cum_pv = pv.cumsum()
-    cum_vol = df["volume"].cumsum().replace(0, math.nan)
-    return (cum_pv / cum_vol).fillna(method="ffill")
-
-
-# =========================================================
-# EODHD DATA
-# =========================================================
-@st.cache_data(ttl=30)
-def eodhd_intraday_5m(symbol_us: str, days_back: int = 5) -> pd.DataFrame:
-    """
-    EODHD intraday docs vary per plan.
-    We request last few days and compute indicators from returned bars.
-    """
-    if not EODHD_API_KEY:
-        return pd.DataFrame()
-
-    # EODHD expects something like AAPL.US
-    url = f"https://eodhd.com/api/intraday/{symbol_us}"
-    from_date = (now_cst() - timedelta(days=days_back)).date().isoformat()
-
-    params = {
-        "api_token": EODHD_API_KEY,
-        "fmt": "json",
-        "interval": "5m",
-        "from": from_date,
-    }
-
-    data = http_get_json(url, params=params)
-    if not isinstance(data, list) or len(data) == 0:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(data)
-    # expected keys: datetime, open, high, low, close, volume
-    if "datetime" not in df.columns:
-        return pd.DataFrame()
-
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df = df.dropna(subset=["datetime"]).sort_values("datetime")
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["close"]).reset_index(drop=True)
-    return df
-
-
-@st.cache_data(ttl=60)
-def eodhd_news(symbol_us: str, minutes_lookback: int = 60, limit: int = 50) -> pd.DataFrame:
-    """
-    Simple news fetch from EODHD.
-    """
-    if not EODHD_API_KEY:
-        return pd.DataFrame()
-
-    url = "https://eodhd.com/api/news"
-    # EODHD uses s=SYMBOL.US or symbols=...
-    since = now_cst() - timedelta(minutes=minutes_lookback)
-    since_iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    params = {
-        "api_token": EODHD_API_KEY,
-        "fmt": "json",
-        "s": symbol_us,
-        "limit": limit,
-        "from": since_iso,
-    }
-
-    try:
-        data = http_get_json(url, params=params)
-    except Exception:
-        return pd.DataFrame()
-
-    if not isinstance(data, list) or len(data) == 0:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(data)
-    # normalize
-    if "date" in df.columns:
-        df["published_utc"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    else:
-        df["published_utc"] = pd.NaT
-
-    df["title"] = df.get("title", "")
-    df["source"] = df.get("source", "")
-    df["link"] = df.get("link", "")
-    df = df[["published_utc", "source", "title", "link"]].dropna(subset=["title"])
-    df = df.sort_values("published_utc", ascending=False).reset_index(drop=True)
-    return df
-
-
-# =========================================================
-# NEWS SENTIMENT (simple, stable wordlist)
-# =========================================================
-POS_WORDS = {"beats", "beat", "surge", "soar", "rally", "upgrade", "wins", "win", "growth", "record", "strong"}
-NEG_WORDS = {"miss", "misses", "drop", "drops", "plunge", "downgrade", "lawsuit", "weak", "fraud", "halt", "crash"}
-
-def simple_sentiment_score(titles: list[str]) -> float:
-    if not titles:
-        return 0.0
-    score = 0
-    for t in titles:
-        low = (t or "").lower()
-        for w in POS_WORDS:
-            if w in low:
-                score += 1
-        for w in NEG_WORDS:
-            if w in low:
-                score -= 1
-    # clamp to [-1, 1]
-    denom = max(5, len(titles))
-    s = score / denom
-    return max(-1.0, min(1.0, s))
-
-
-# =========================================================
-# UNUSUAL WHALES (UW) DATA
-# =========================================================
-def uw_headers():
-    # UW uses: Authorization: Bearer <token>
-    if not UW_TOKEN:
-        return {}
-    return {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json, text/plain"}
-
-
-@st.cache_data(ttl=60)
-def uw_options_volume(ticker: str) -> dict:
-    """
-    Correct endpoint you posted:
-    GET https://api.unusualwhales.com/api/stock/{ticker}/options-volume
-    """
-    if not UW_TOKEN:
-        return {}
-
-    url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-volume"
-    data = http_get_json(url, headers=uw_headers())
-    # data is {"data":[{...}]}
-    rows = data.get("data", []) if isinstance(data, dict) else []
-    return rows[0] if rows else {}
-
-
-@st.cache_data(ttl=30)
-def uw_flow_alerts(limit: int = 200) -> list[dict]:
-    """
-    Uses the URL you put in secrets:
-    UW_FLOW_ALERTS_URL = https://api.unusualwhales.com/api/option-trade/flow-alerts
-    """
-    if not UW_TOKEN or not UW_FLOW_ALERTS_URL:
-        return []
-
-    params = {"limit": limit}
-    # Some UW endpoints use pagination/filters. We keep it simple and filter client-side.
-    data = http_get_json(UW_FLOW_ALERTS_URL, headers=uw_headers(), params=params)
-    # Usually {"data":[...]}
-    if isinstance(data, dict) and isinstance(data.get("data"), list):
-        return data["data"]
-    # sometimes returns a list directly
-    if isinstance(data, list):
-        return data
-    return []
-
-
-# =========================================================
-# FLOW FILTERING (your rules)
-# =========================================================
-def is_itm(option_type: str, strike: float, underlying: float) -> bool:
-    if option_type == "call":
-        return underlying > strike
-    if option_type == "put":
-        return underlying < strike
-    return False
-
-
-def dte_days(expiry_str: str) -> int | None:
-    try:
-        exp = datetime.fromisoformat(expiry_str).date()
-        today = now_cst().date()
-        return (exp - today).days
-    except Exception:
-        return None
-
-
-def normalize_and_filter_alerts(alerts: list[dict], tickers_set: set[str]) -> pd.DataFrame:
-    """
-    Apply:
-    - premium >= 1,000,000
-    - DTE <= 3
-    - Volume > OI
-    - Exclude ITM
-    - Tickers filter
-    """
-    out = []
-    for a in alerts:
-        sym = (a.get("underlying_symbol") or a.get("symbol") or "").upper().strip()
-        if not sym or sym not in tickers_set:
-            continue
-
-        premium = safe_float(a.get("premium"), 0.0)
-        if premium < 1_000_000:
-            continue
-
-        expiry = a.get("expiry") or a.get("expiration") or a.get("exp") or ""
-        dte = dte_days(str(expiry)) if expiry else None
-        if dte is None or dte > 3 or dte < 0:
-            continue
-
-        vol = safe_int(a.get("volume"), 0) or 0
-        oi = safe_int(a.get("open_interest"), 0) or 0
-        if not (vol > oi):
-            continue
-
-        opt_type = (a.get("option_type") or a.get("type") or "").lower().strip()
-        strike = safe_float(a.get("strike"), None)
-        und = safe_float(a.get("underlying_price"), None)
-        if strike is not None and und is not None and opt_type in {"call", "put"}:
-            if is_itm(opt_type, strike, und):
-                continue
-
-        executed_at = a.get("executed_at") or a.get("timestamp") or ""
-        out.append({
-            "Ticker": sym,
-            "Type": opt_type.upper() if opt_type else "",
-            "Strike": strike,
-            "Expiry": expiry,
-            "DTE": dte,
-            "Premium": premium,
-            "Volume": vol,
-            "OI": oi,
-            "SideTags": ",".join(a.get("tags", [])) if isinstance(a.get("tags"), list) else "",
-            "Executed": executed_at,
-        })
-
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-    df = df.sort_values("Premium", ascending=False).reset_index(drop=True)
-    return df
-
-
-# =========================================================
-# 10Y YIELD (OPTIONAL / BEST-EFFORT)
-# =========================================================
-@st.cache_data(ttl=120)
-def ten_year_yield_optional() -> float | None:
-    """
-    Not all EODHD plans support macro/bonds the same way.
-    We attempt a common symbol. If it fails, we return None (and UI shows 'Not available (ok)').
-    """
-    if not EODHD_API_KEY:
-        return None
-
-    # Common attempts (may fail depending on plan)
-    candidates = [
-        "US10Y.INDX",
-        "US10Y.YIELD",
-        "US10Y",
-    ]
-
-    for sym in candidates:
-        try:
-            url = f"https://eodhd.com/api/real-time/{sym}"
-            params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-            data = http_get_json(url, params=params)
-            # try common keys
-            val = safe_float(data.get("close")) or safe_float(data.get("price")) or safe_float(data.get("value"))
-            if val is not None:
-                return val
-        except Exception:
-            continue
-    return None
-
-
-# =========================================================
-# SCORING (CALLS/PUTS ONLY)
-# =========================================================
-def compute_signal_row(ticker: str, df_ohlcv: pd.DataFrame, uw_vol: dict, news_df: pd.DataFrame,
-                       y10: float | None,
-                       weights: dict,
-                       institutional_min: int) -> dict:
-
-    # defaults if we can't compute
-    base = {
-        "Ticker": ticker,
-        "Confidence": 50,
-        "Direction": "—",
-        "Signal": "WAIT",
-        "UW Unusual": "NO",
-        "UW Bias": "Neutral",
-        "Gamma bias": "Neutral",
-        "RSI": None,
-        "MACD_hist": None,
-        "VWAP": None,
-        "EMA stack": None,
-        "Vol_ratio": None,
-        "IV spike": "None",
-        "10Y": y10 if y10 is not None else "N/A",
-    }
-
-    if df_ohlcv is None or df_ohlcv.empty or len(df_ohlcv) < 35:
-        base["Signal"] = "WAIT"
-        base["Direction"] = "—"
-        base["Confidence"] = 50
-        return base
-
-    df = df_ohlcv.copy()
-
-    close = df["close"]
-    df["EMA9"] = ema(close, 9)
-    df["EMA20"] = ema(close, 20)
-    df["EMA50"] = ema(close, 50)
-    df["RSI"] = rsi(close, 14)
-    df["MACD_H"] = macd_hist(close)
-    df["VWAP"] = vwap_from_ohlcv(df)
-
-    # volume ratio (last volume / avg last 20)
-    vol = df["volume"].fillna(0)
-    vol_avg = vol.rolling(20).mean()
-    vol_ratio = (vol / vol_avg.replace(0, math.nan)).iloc[-1]
-    vol_ratio = float(vol_ratio) if pd.notna(vol_ratio) else None
-
-    last_close = float(close.iloc[-1])
-    last_vwap = float(df["VWAP"].iloc[-1])
-    last_rsi = float(df["RSI"].iloc[-1])
-    last_macd_h = float(df["MACD_H"].iloc[-1])
-
-    ema9 = float(df["EMA9"].iloc[-1])
-    ema20 = float(df["EMA20"].iloc[-1])
-    ema50 = float(df["EMA50"].iloc[-1])
-
-    # EMA stack: bullish if 9>20>50 and price above 9
-    ema_stack = "Neutral"
-    if ema9 > ema20 > ema50 and last_close >= ema9:
-        ema_stack = "Bullish"
-    elif ema9 < ema20 < ema50 and last_close <= ema9:
-        ema_stack = "Bearish"
-
-    vwap_bias = "Above" if last_close >= last_vwap else "Below"
-
-    # UW options-volume bias
-    uw_bias = "Neutral"
-    gamma_bias = "Neutral"
-    iv_spike = "None"
-
-    if uw_vol:
-        bull_prem = safe_float(uw_vol.get("bullish_premium"), 0.0) or 0.0
-        bear_prem = safe_float(uw_vol.get("bearish_premium"), 0.0) or 0.0
-        if bull_prem > bear_prem * 1.1:
-            uw_bias = "Bullish"
-        elif bear_prem > bull_prem * 1.1:
-            uw_bias = "Bearish"
-
-        call_oi = safe_float(uw_vol.get("call_open_interest"), 0.0) or 0.0
-        put_oi = safe_float(uw_vol.get("put_open_interest"), 0.0) or 0.0
-        net_call = safe_float(uw_vol.get("net_call_premium"), 0.0) or 0.0
-        net_put = safe_float(uw_vol.get("net_put_premium"), 0.0) or 0.0
-
-        # Gamma proxy: OI dominance + net premium dominance
-        if call_oi > put_oi and net_call >= net_put:
-            gamma_bias = "Positive Gamma (proxy)"
-        elif put_oi > call_oi and net_put >= net_call:
-            gamma_bias = "Negative Gamma (proxy)"
-
-        # IV spike proxy: today's call/put volume vs 30d avg volume
-        call_vol = safe_float(uw_vol.get("call_volume"), 0.0) or 0.0
-        put_vol = safe_float(uw_vol.get("put_volume"), 0.0) or 0.0
-        avg30c = safe_float(uw_vol.get("avg_30_day_call_volume"), None)
-        avg30p = safe_float(uw_vol.get("avg_30_day_put_volume"), None)
-        spike = False
-        if avg30c and avg30c > 0 and call_vol / avg30c >= 1.8:
-            spike = True
-        if avg30p and avg30p > 0 and put_vol / avg30p >= 1.8:
-            spike = True
-        iv_spike = "YES (proxy)" if spike else "None"
-
-    # News sentiment (simple)
-    news_sent = 0.0
-    if news_df is not None and not news_df.empty:
-        titles = news_df["title"].astype(str).head(10).tolist()
-        news_sent = simple_sentiment_score(titles)
-
-    # ---------------------------------------------------------
-    # SCORING → map to CALLS vs PUTS
-    # ---------------------------------------------------------
-    bull_points = 0.0
-    bear_points = 0.0
-
-    # VWAP
-    if vwap_bias == "Above":
-        bull_points += weights["vwap"]
-    else:
-        bear_points += weights["vwap"]
-
-    # EMA stack
-    if ema_stack == "Bullish":
-        bull_points += weights["ema"]
-    elif ema_stack == "Bearish":
-        bear_points += weights["ema"]
-
-    # RSI
-    # bullish if rising off oversold-ish, bearish if falling from overbought-ish
-    if last_rsi <= 35:
-        bull_points += weights["rsi"] * 0.8
-    elif last_rsi >= 65:
-        bear_points += weights["rsi"] * 0.8
-
-    # MACD hist
-    if last_macd_h > 0:
-        bull_points += weights["macd"]
-    elif last_macd_h < 0:
-        bear_points += weights["macd"]
-
-    # Volume ratio
-    if vol_ratio is not None:
-        if vol_ratio >= 1.5:
-            # direction depends on trend
-            if ema_stack == "Bullish" or vwap_bias == "Above":
-                bull_points += weights["vol"]
-            elif ema_stack == "Bearish" or vwap_bias == "Below":
-                bear_points += weights["vol"]
-
-    # UW bias
-    if uw_bias == "Bullish":
-        bull_points += weights["uw"]
-    elif uw_bias == "Bearish":
-        bear_points += weights["uw"]
-
-    # News sentiment
-    if news_sent > 0.15:
-        bull_points += weights["news"]
-    elif news_sent < -0.15:
-        bear_points += weights["news"]
-
-    # 10Y filter (optional): rising yields can pressure growth / risk (rough)
-    # If not available, it doesn't affect scoring.
-    if isinstance(y10, (int, float)):
-        # tiny influence only
-        if y10 >= 4.5:  # rough threshold, tweak later
-            bear_points += weights["y10"]
-        elif y10 <= 3.5:
-            bull_points += weights["y10"]
-
-    # Normalize to 0..100 confidence
-    total = max(0.0001, bull_points + bear_points)
-    bull_conf = (bull_points / total) * 100.0
-    bear_conf = (bear_points / total) * 100.0
-
-    # Pick direction by stronger side
-    if bull_conf > bear_conf:
-        direction = "CALLS"
-        confidence = int(round(bull_conf))
-    elif bear_conf > bull_conf:
-        direction = "PUTS"
-        confidence = int(round(bear_conf))
-    else:
-        direction = "—"
-        confidence = 50
-
-    signal = "WAIT"
-    if confidence >= institutional_min:
-        signal = f"BUY {direction}"
-
-    base.update({
-        "Confidence": confidence,
-        "Direction": direction if direction != "—" else "—",
-        "Signal": signal,
-        "UW Bias": uw_bias,
-        "Gamma bias": gamma_bias,
-        "RSI": round(last_rsi, 1),
-        "MACD_hist": round(last_macd_h, 4),
-        "VWAP": vwap_bias,
-        "EMA stack": ema_stack,
-        "Vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
-        "IV spike": iv_spike,
-    })
-
-    return base
-
-
-# =========================================================
-# UI (SIDEBAR)
-# =========================================================
-st.title("🏛️ Institutional Options Signals (5m) — CALLS / PUTS ONLY")
-st.caption(f"Last update (CST): **{fmt_cst(now_cst())}**")
-
-with st.sidebar:
-    st.header("Settings")
-
-    # ✅ You can type ANY ticker(s)
-    tickers_text = st.text_input(
-        "Tickers (type any, comma-separated)",
-        value="SPY, TSLA",
-        help="Example: SPY, QQQ, NVDA, AAPL, MSFT (commas or spaces work)",
-    )
-
-    # parse tickers
-    raw = tickers_text.replace("\n", " ").replace(";", ",").replace("|", ",")
-    parts = [p.strip().upper() for p in raw.replace(" ", ",").split(",") if p.strip()]
-    # remove garbage
-    tickers = []
-    for t in parts:
-        t = "".join(ch for ch in t if ch.isalnum() or ch in {".", "-", "_"})
-        if t and t not in tickers:
-            tickers.append(t)
-
-    if not tickers:
-        tickers = ["SPY"]
-
-    news_minutes = st.number_input("News lookback (minutes)", 1, 240, 60, 5)
-    price_lookback_minutes = st.number_input("Price lookback (minutes)", 60, 1440, 240, 60)
-
-    st.divider()
-    st.subheader("Institutional mode")
-    institutional_min = st.slider("Minimum confidence (signals)", 50, 95, 75, 1)
-
-    st.divider()
-    st.subheader("Refresh")
-    refresh_seconds = st.slider("Auto-refresh (seconds)", 10, 180, 30, 5)
-
-    st.divider()
-    st.subheader("Weights (total doesn't have to be 1)")
-    w_vwap = st.slider("VWAP", 0.0, 0.5, 0.15, 0.01)
-    w_ema  = st.slider("EMA stack (9/20/50)", 0.0, 0.5, 0.18, 0.01)
-    w_rsi  = st.slider("RSI", 0.0, 0.5, 0.15, 0.01)
-    w_macd = st.slider("MACD hist", 0.0, 0.5, 0.18, 0.01)
-    w_vol  = st.slider("Volume ratio", 0.0, 0.5, 0.12, 0.01)
-    w_uw   = st.slider("UW options-volume bias", 0.0, 0.7, 0.18, 0.01)
-    w_news = st.slider("News sentiment", 0.0, 0.5, 0.04, 0.01)
-    w_y10  = st.slider("10Y yield (optional)", 0.0, 0.2, 0.05, 0.01)
-
-weights = {
-    "vwap": w_vwap,
-    "ema": w_ema,
-    "rsi": w_rsi,
-    "macd": w_macd,
-    "vol": w_vol,
-    "uw": w_uw,
-    "news": w_news,
-    "y10": w_y10,
-}
-
-# Auto-refresh
-st_autorefresh(interval=int(refresh_seconds * 1000), key="auto_refresh")
-
-
-# =========================================================
-# STATUS PANEL (GREEN/RED)
-# =========================================================
-with st.sidebar:
-    st.divider()
-    st.subheader("Keys status (green/red)")
-
-    if EODHD_API_KEY:
-        st.success("EODHD_API_KEY ✅")
-    else:
-        st.error("EODHD_API_KEY ❌ (missing)")
-
-    if UW_TOKEN:
-        st.success("UW_TOKEN (Bearer) ✅")
-    else:
-        st.error("UW_TOKEN ❌ (missing)")
-
-    if UW_FLOW_ALERTS_URL and "api.unusualwhales.com" in UW_FLOW_ALERTS_URL:
-        st.success("UW_FLOW_ALERTS_URL ✅")
-    else:
-        st.error("UW_FLOW_ALERTS_URL ❌ (must be api.unusualwhales.com)")
-
-    st.divider()
-    st.subheader("Endpoints status")
-
-    # quick pings (best-effort)
-    # EODHD intraday test
-    try:
-        test_sym = f"{tickers[0]}.US"
-        test_df = eodhd_intraday_5m(test_sym)
-        if not test_df.empty:
-            st.success("EODHD intraday ✅")
-        else:
-            st.error("EODHD intraday ❌ (empty/no permission)")
-    except Exception as e:
-        st.error(f"EODHD intraday ❌ ({str(e)[:60]})")
-
-    # EODHD news test
-    try:
-        test_news = eodhd_news(f"{tickers[0]}.US", minutes_lookback=int(news_minutes))
-        st.success("EODHD news ✅" if not test_news.empty else "EODHD news ✅ (no headlines)")
-    except Exception as e:
-        st.error(f"EODHD news ❌ ({str(e)[:60]})")
-
-    # UW options volume test
-    try:
-        ov = uw_options_volume(tickers[0])
-        st.success("UW options-volume ✅" if ov else "UW options-volume ❌ (empty)")
-    except Exception as e:
-        st.error(f"UW options-volume ❌ ({str(e)[:60]})")
-
-    # UW flow alerts test
-    try:
-        fa = uw_flow_alerts(limit=20)
-        st.success("UW flow-alerts ✅" if isinstance(fa, list) else "UW flow-alerts ❌")
-    except Exception as e:
-        st.error(f"UW flow-alerts ❌ ({str(e)[:60]})")
-
-    # 10Y (optional)
-    try:
-        y10 = ten_year_yield_optional()
-        if y10 is None:
-            st.info("10Y yield (optional) — Not available (ok)")
-        else:
-            st.success(f"10Y yield ✅ ({y10:.2f})")
-    except Exception:
-        st.info("10Y yield (optional) — Not available (ok)")
-
-
-# =========================================================
-# MAIN LAYOUT
-# =========================================================
-left, right = st.columns([1.2, 1])
-
-with left:
+with col_left:
     st.subheader("Unusual Whales Screener (web view)")
     st.caption("This is embedded. True filtering is best done inside the screener itself.")
-    st.components.v1.iframe(UW_SCREENER_URL, height=850, scrolling=True)
+    components.iframe(UW_SCREENER_URL, height=820, scrolling=True)
 
-with right:
-    st.subheader("Live Score / Signals (EODHD price + EODHD headlines + UW flow)")
 
-    # fetch 10Y once
+# =========================
+#   DATA PULLS (right side)
+# =========================
+# Endpoint checks
+eodhd_ok = True
+uwflow_ok = True
+uwvol_ok = True
+news_ok = True
+
+# Optional 10Y
+y10, y10_status = fetch_10y_yield_optional()
+# We treat 10Y failures as "ok" (optional)
+y10_label = f"{y10:.2f}" if isinstance(y10, (int, float)) else "N/A"
+
+# UW flow alerts (global pull once)
+flow_items, flow_status = uw_flow_alerts(limit=400)
+if flow_status != "ok" and flow_status != "missing_key":
+    uwflow_ok = False
+
+# Apply filters you requested
+filtered_flow = filter_flow_alerts(
+    flow_items if isinstance(flow_items, list) else [],
+    min_premium=1_000_000,
+    max_dte=3,
+    require_vol_gt_oi=True,
+    exclude_itm=True
+)
+
+# Create per ticker flow map, within recent window
+flow_cutoff = datetime.now(tz=UTC) - timedelta(minutes=int(price_lookback))
+flow_by_ticker = {}
+for it in filtered_flow:
+    sym = str(it.get("underlying_symbol") or it.get("ticker") or "").upper().strip()
+    if not sym:
+        continue
+    # executed_at is ISO in UTC
+    ex = it.get("executed_at")
     try:
-        y10_val = ten_year_yield_optional()
+        exdt = pd.to_datetime(ex, utc=True, errors="coerce")
+        if pd.isna(exdt):
+            continue
+        if exdt.to_pydatetime().replace(tzinfo=UTC) < flow_cutoff:
+            continue
     except Exception:
-        y10_val = None
+        pass
+    flow_by_ticker.setdefault(sym, []).append(it)
 
-    # compute per ticker
-    rows = []
-    debug_rows = []
 
-    for t in tickers:
-        sym_us = f"{t}.US"
+# =========================
+#   BUILD TABLE
+# =========================
+rows = []
+debug_rows = []
 
-        # price bars
-        df_bars = pd.DataFrame()
-        try:
-            df_bars = eodhd_intraday_5m(sym_us, days_back=6)
-        except Exception as e:
-            debug_rows.append({"Ticker": t, "Data mode": "price_error", "Bars": 0, "Last bar": str(e)[:80]})
+if not tickers:
+    st.warning("Type at least one ticker in the sidebar (example: SPY,TSLA,NVDA).")
 
-        # keep only last lookback minutes
-        if not df_bars.empty:
-            cutoff = now_cst().astimezone(timezone.utc) - timedelta(minutes=int(price_lookback_minutes))
-            # bars datetime might be naive; coerce to UTC-ish by treating as UTC
-            dt = pd.to_datetime(df_bars["datetime"], errors="coerce")
-            df_bars = df_bars.loc[dt >= cutoff.replace(tzinfo=None)].copy()
-            df_bars = df_bars.reset_index(drop=True)
+for t in tickers:
+    sym_us = ensure_us_symbol(t)
 
-        # UW options volume
-        uw_vol = {}
-        try:
-            uw_vol = uw_options_volume(t)
-        except Exception as e:
-            debug_rows.append({"Ticker": t, "Data mode": "uw_vol_error", "Bars": len(df_bars), "Last bar": str(e)[:80]})
+    # EODHD intraday candles
+    df, df_status = eodhd_intraday(sym_us, interval="5m", lookback_minutes=int(price_lookback))
+    if df_status not in ("ok", "few_bars", "empty") and df_status != "missing_key":
+        eodhd_ok = False
 
-        # news
-        news_df = pd.DataFrame()
-        try:
-            news_df = eodhd_news(sym_us, minutes_lookback=int(news_minutes))
-        except Exception as e:
-            debug_rows.append({"Ticker": t, "Data mode": "news_error", "Bars": len(df_bars), "Last bar": str(e)[:80]})
+    # EODHD news
+    news_items, news_status = eodhd_news(sym_us, lookback_minutes=int(news_lookback))
+    if news_status not in ("ok", "empty") and news_status != "missing_key":
+        news_ok = False
 
-        row = compute_signal_row(
-            ticker=t,
-            df_ohlcv=df_bars,
-            uw_vol=uw_vol,
-            news_df=news_df,
-            y10=y10_val,
-            weights=weights,
-            institutional_min=int(institutional_min),
-        )
-        rows.append(row)
+    # UW options volume bias
+    uw_bias, uw_bias_status = uw_options_volume_bias(t)
+    if uw_bias_status not in ("ok", "empty") and uw_bias_status != "missing_key":
+        uwvol_ok = False
 
-    signals_df = pd.DataFrame(rows)
+    flow_for_t = flow_by_ticker.get(t, [])
 
-    st.caption(f"Last update (CST): **{fmt_cst(now_cst())}**")
-    st.dataframe(signals_df, use_container_width=True, hide_index=True)
+    row = build_signal_row(
+        t, df, uw_bias, flow_for_t, y10,
+        weights=weights, institutional_cutoff=int(institutional_cutoff)
+    )
+    rows.append(row)
 
-    # Institutional alerts (>= threshold only)
-    st.subheader(f"Institutional Alerts (≥{institutional_min} only)")
-    inst = signals_df[signals_df["Confidence"] >= int(institutional_min)].copy()
+    debug_rows.append({
+        "Ticker": t,
+        "intraday_status": df_status,
+        "news_status": news_status,
+        "uw_options_volume_status": uw_bias_status,
+        "uw_flow_status": flow_status,
+        "flow_hits_in_window": len(flow_for_t),
+        "bars": (len(df) if isinstance(df, pd.DataFrame) else 0),
+        "last_bar(CST)": (df["datetime"].iloc[-1].strftime("%Y-%m-%d %H:%M:%S") if isinstance(df, pd.DataFrame) and len(df) else ""),
+    })
+
+
+# =========================
+#   SHOW ENDPOINT STATUS (sidebar)
+# =========================
+with st.sidebar:
+    lines = []
+    lines.append(("EODHD intraday", eodhd_ok))
+    lines.append(("EODHD news", news_ok))
+    lines.append(("UW options-volume", uwvol_ok))
+    lines.append(("UW flow-alerts", uwflow_ok))
+    # 10Y is optional; show gray if N/A
+    # We don't mark failure as red.
+    endpoint_box.empty()
+    for label, ok in lines:
+        if ok:
+            st.success(label)
+        else:
+            st.error(label)
+
+    st.info(f"10Y yield (optional): {y10_label}")
+
+
+# =========================
+#   RIGHT PANEL UI
+# =========================
+with col_right:
+    st.subheader("Live Score / Signals (EODHD price + EODHD headlines + UW flow)")
+    st.caption(f"Last update (CST): {fmt_cst(now_cst())}")
+
+    out_df = pd.DataFrame(rows)
+
+    # Order columns (clean)
+    col_order = [
+        "Ticker", "Confidence", "Direction", "Signal",
+        "UW Unusual", "UW Bias",
+        "RSI", "MACD_hist", "VWAP", "EMA stack", "Vol_ratio",
+        "IV spike", "Gamma bias", "10Y"
+    ]
+    out_df = out_df[[c for c in col_order if c in out_df.columns]]
+
+    st.dataframe(out_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Institutional Alerts (≥75 only)")
+    inst = out_df[(out_df["Confidence"] >= int(institutional_cutoff)) & (out_df["Signal"] != "WAIT")]
     if inst.empty:
         st.info("No institutional signals right now.")
     else:
-        for _, r in inst.iterrows():
-            st.success(f"{r['Ticker']}: {r['Signal']} | Confidence={r['Confidence']} | UW={r['UW Bias']} | IV={r['IV spike']} | Gamma={r['Gamma bias']}")
+        for _, r in inst.sort_values("Confidence", ascending=False).iterrows():
+            st.success(f"{r['Ticker']}: {r['Signal']} | Confidence={r['Confidence']} | UW={r['UW Unusual']} | IV={r['IV spike']} | Gamma={r['Gamma bias']}")
 
-    # UW flow alerts section (filtered)
+    st.divider()
     st.subheader("Unusual Flow Alerts (UW API)")
-    st.caption("Rules applied: premium ≥ $1M, DTE ≤ 3, Volume > OI, exclude ITM, ticker-matched.")
-    try:
-        raw_alerts = uw_flow_alerts(limit=400)
-        alerts_df = normalize_and_filter_alerts(raw_alerts, set(tickers))
-        if alerts_df.empty:
-            st.info("No matching UW flow alerts right now (or market quiet / after-hours).")
+    st.caption("Rules applied: premium ≥ $1M, DTE ≤ 3, Volume > OI, exclude ITM. (Best-effort based on fields available.)")
+
+    if flow_status == "missing_key":
+        st.warning("UW_TOKEN missing in Secrets.")
+    elif flow_status != "ok":
+        st.error(f"UW flow fetch failed: {flow_status} (check UW_FLOW_ALERTS_URL + token)")
+    else:
+        # Show a small table of recent filtered flow for selected tickers only
+        show = []
+        for t in tickers:
+            for it in (flow_by_ticker.get(t, []) or [])[:10]:
+                show.append({
+                    "Ticker": t,
+                    "executed_at": str(it.get("executed_at", "")),
+                    "option": str(it.get("option_chain_id", ""))[:28],
+                    "type": str(it.get("option_type", "")),
+                    "premium": it.get("premium"),
+                    "dte": it.get("dte"),
+                    "iv": it.get("implied_volatility"),
+                    "gamma": it.get("gamma"),
+                    "tags": ", ".join(it.get("tags") or []) if isinstance(it.get("tags"), list) else str(it.get("tags") or "")
+                })
+        if not show:
+            st.info("No UW flow alerts matching your rules in the current window (normal after-hours sometimes).")
         else:
-            st.dataframe(alerts_df.head(50), use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"UW flow fetch failed: {e}")
+            show_df = pd.DataFrame(show)
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-    # News section
-    st.subheader(f"News — last {news_minutes} minutes (EODHD)")
-    news_frames = []
+    st.divider()
+    st.subheader(f"News — last {int(news_lookback)} minutes (EODHD)")
+    all_news = []
     for t in tickers:
-        sym_us = f"{t}.US"
-        df_n = eodhd_news(sym_us, minutes_lookback=int(news_minutes))
-        if not df_n.empty:
-            df_n = df_n.copy()
-            df_n.insert(0, "Ticker", t)
-            news_frames.append(df_n)
+        sym_us = ensure_us_symbol(t)
+        items, status = eodhd_news(sym_us, lookback_minutes=int(news_lookback))
+        if isinstance(items, list) and items:
+            all_news.extend(items)
 
-    if not news_frames:
+    if not all_news:
         st.info("No news in this lookback window (or EODHD returned none).")
     else:
-        news_all = pd.concat(news_frames, ignore_index=True)
-        # show CST time column
-        news_all["published_cst"] = news_all["published_utc"].dt.tz_convert("America/Chicago") if news_all["published_utc"].dt.tz is not None else news_all["published_utc"]
-        news_all = news_all[["Ticker", "published_cst", "source", "title", "link"]]
-        st.dataframe(news_all, use_container_width=True, hide_index=True)
-        st.caption("Clickable links:")
-        for _, r in news_all.head(20).iterrows():
-            if r.get("link"):
-                st.markdown(f"- **{r['Ticker']}** — [{r['title']}]({r['link']})")
+        news_df = pd.DataFrame(all_news).sort_values("Published (CST)", ascending=False)
+        st.dataframe(news_df[["Ticker", "Published (CST)", "Source", "Title", "URL"]], use_container_width=True, hide_index=True)
+        st.caption("Tip: Click URL column links (or copy/paste).")
 
-    # Debug
-    with st.expander("Debug (why indicators might be None)"):
-        if debug_rows:
-            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
-        else:
-            st.write("No debug warnings right now.")
+    with st.expander("Debug (why something might show N/A)"):
+        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
