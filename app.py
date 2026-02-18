@@ -3,133 +3,145 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime, timezone
-from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# ==============================
+# =============================
 # CONFIG
-# ==============================
-st.set_page_config(page_title="Institutional Options Signals", layout="wide")
+# =============================
 
-DEFAULT_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "TSLA", "NVDA", "AMD"]
+st.set_page_config(page_title="Institutional Options Engine", layout="wide")
 
 EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", "")
-UW_BEARER = st.secrets.get("UW_BEARER", "")
+UW_TOKEN = st.secrets.get("UW_TOKEN", "")
 
-# ==============================
-# HELPERS
-# ==============================
-def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+CST = ZoneInfo("America/Chicago")
 
-# ------------------------------
-# EODHD INTRADAY DATA (FIXED)
-# ------------------------------
-def get_intraday_data(ticker, interval="5m"):
+DEFAULT_TICKERS = ["SPY", "QQQ", "TSLA", "NVDA"]
+
+# =============================
+# TIME
+# =============================
+
+def now_cst():
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+# =============================
+# DATA FETCHING
+# =============================
+
+def get_intraday_data(ticker):
+    url = f"https://eodhd.com/api/intraday/{ticker}.US"
+    params = {
+        "api_token": EODHD_API_KEY,
+        "interval": "5m",
+        "fmt": "json",
+        "outputsize": 200
+    }
+
     try:
-        url = f"https://eodhd.com/api/intraday/{ticker}.US"
-        params = {
-            "api_token": EODHD_API_KEY,
-            "interval": interval,
-            "fmt": "json"
-        }
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params)
+        r.raise_for_status()
         data = r.json()
-        df = pd.DataFrame(data)
 
-        if df.empty:
+        if not data:
             return None
 
+        df = pd.DataFrame(data)
         df["datetime"] = pd.to_datetime(df["datetime"])
         df.set_index("datetime", inplace=True)
+        df = df.sort_index()
+
         return df
 
     except:
         return None
 
-# ------------------------------
-# 10Y YIELD FILTER
-# ------------------------------
 def get_10y_yield():
-    try:
-        url = "https://eodhd.com/api/real-time/US10Y.BOND"
-        params = {"api_token": EODHD_API_KEY}
-        r = requests.get(url, params=params)
-        return float(r.json().get("close", 0))
-    except:
-        return 0
+    url = "https://eodhd.com/api/real-time/US10Y.BOND"
+    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
 
-# ------------------------------
-# UNUSUAL WHALES OPTIONS VOLUME
-# ------------------------------
-def get_uw_options_volume(ticker):
     try:
-        url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-volume"
-        headers = {
-            "Authorization": f"Bearer {UW_BEARER}",
-            "Accept": "application/json"
-        }
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, params=params)
+        r.raise_for_status()
+        return float(r.json()["close"])
+    except:
+        return None
+
+def get_uw_options_volume(ticker):
+    url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-volume"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {UW_TOKEN}"
+    }
+
+    try:
+        r = requests.get(url, headers=headers)
+        r.raise_for_status()
         data = r.json()["data"][0]
         return data
     except:
         return None
 
-# ==============================
+# =============================
 # INDICATORS
-# ==============================
-def calculate_indicators(df):
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    volume = df["volume"]
+# =============================
 
-    df["EMA9"] = close.ewm(span=9).mean()
-    df["EMA20"] = close.ewm(span=20).mean()
-    df["EMA50"] = close.ewm(span=50).mean()
+def calculate_indicators(df):
+
+    # EMA
+    df["EMA9"] = df["close"].ewm(span=9).mean()
+    df["EMA20"] = df["close"].ewm(span=20).mean()
+    df["EMA50"] = df["close"].ewm(span=50).mean()
+
+    # VWAP
+    df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
     # RSI
-    delta = close.diff()
+    delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
+
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
     # MACD
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
+    ema12 = df["close"].ewm(span=12).mean()
+    ema26 = df["close"].ewm(span=26).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_signal"] = df["MACD"].ewm(span=9).mean()
     df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
 
-    # VWAP
-    df["VWAP"] = (volume * (high + low + close) / 3).cumsum() / volume.cumsum()
+    # Volume Ratio
+    df["Vol_ratio"] = df["volume"] / df["volume"].rolling(20).mean()
 
-    # Volume ratio
-    df["Vol_ratio"] = volume / volume.rolling(20).mean()
+    # IV proxy (volatility spike using ATR % move)
+    df["TR"] = df["high"] - df["low"]
+    df["ATR"] = df["TR"].rolling(14).mean()
+    df["IV_spike"] = df["ATR"] > df["ATR"].rolling(20).mean() * 1.5
 
     return df
 
-# ==============================
-# INSTITUTIONAL SCORING
-# ==============================
+# =============================
+# INSTITUTIONAL SCORE ENGINE
+# =============================
+
 def institutional_score(df, ticker):
 
-    if df is None or len(df) < 50:
-        return 50, "WAIT"
-
-    df = calculate_indicators(df)
     last = df.iloc[-1]
-
     score = 50
+    direction = None
 
-    # Trend bias
+    # EMA stack trend
     if last["EMA9"] > last["EMA20"] > last["EMA50"]:
         score += 10
-    if last["EMA9"] < last["EMA20"] < last["EMA50"]:
+        direction = "CALL"
+    elif last["EMA9"] < last["EMA20"] < last["EMA50"]:
         score -= 10
+        direction = "PUT"
 
     # VWAP bias
     if last["close"] > last["VWAP"]:
@@ -138,85 +150,102 @@ def institutional_score(df, ticker):
         score -= 10
 
     # RSI
-    if last["RSI"] > 60:
-        score += 10
-    if last["RSI"] < 40:
-        score -= 10
+    if last["RSI"] > 55:
+        score += 8
+    elif last["RSI"] < 45:
+        score -= 8
 
     # MACD
     if last["MACD_hist"] > 0:
-        score += 10
+        score += 8
     else:
-        score -= 10
+        score -= 8
 
-    # Volume spike
+    # Volume Spike
     if last["Vol_ratio"] > 1.5:
-        score += 10
+        score += 5
 
-    # 10Y yield macro filter
+    # IV Spike
+    if last["IV_spike"]:
+        score += 5
+
+    # 10Y Yield filter
     yield_10y = get_10y_yield()
-    if yield_10y > 4.2:
-        score -= 10
-    if yield_10y < 4.0:
-        score += 10
+    if yield_10y:
+        if yield_10y > 4.2:
+            score -= 8
+        elif yield_10y < 4.0:
+            score += 8
 
-    # Unusual Whales options bias
+    # UW Options Bias
     uw = get_uw_options_volume(ticker)
+    gamma_bias = "Neutral"
+
     if uw:
-        if float(uw["bullish_premium"]) > float(uw["bearish_premium"]):
-            score += 10
-        else:
-            score -= 10
+        bull = float(uw["bullish_premium"])
+        bear = float(uw["bearish_premium"])
+
+        if bull > bear:
+            score += 12
+            gamma_bias = "Positive Gamma"
+        elif bear > bull:
+            score -= 12
+            gamma_bias = "Negative Gamma"
 
     score = max(0, min(100, score))
 
     if score >= 75:
-        return score, "BUY CALLS"
+        signal = "BUY CALLS"
     elif score <= 25:
-        return score, "BUY PUTS"
+        signal = "BUY PUTS"
     else:
-        return score, "WAIT"
+        signal = "WAIT"
 
-# ==============================
+    return score, signal, gamma_bias
+
+# =============================
 # UI
-# ==============================
+# =============================
+
 st.title("🏛 Institutional Options Signals (5m) — CALLS / PUTS ONLY")
 
-st_autorefresh(interval=60 * 1000, key="refresh")
+st.caption(f"Last update (CST): {now_cst()}")
 
-with st.sidebar:
-    st.header("Settings")
-    tickers = st.multiselect("Tickers", DEFAULT_TICKERS, default=["SPY", "QQQ"])
-    st.caption("Institutional mode: Signals only above 75 confidence")
-
-st.subheader("Live Signals")
-st.write(f"Last update (UTC): {utc_now()}")
+tickers = st.multiselect("Tickers", DEFAULT_TICKERS, default=["SPY", "QQQ"])
 
 results = []
 
 for ticker in tickers:
     df = get_intraday_data(ticker)
-    score, signal = institutional_score(df, ticker)
+    if df is None:
+        continue
+
+    df = calculate_indicators(df)
+    score, signal, gamma_bias = institutional_score(df, ticker)
+    last = df.iloc[-1]
 
     results.append({
         "Ticker": ticker,
         "Confidence": score,
-        "Signal": signal
+        "Signal": signal,
+        "RSI": round(last["RSI"], 1),
+        "MACD_hist": round(last["MACD_hist"], 4),
+        "VWAP_above": last["close"] > last["VWAP"],
+        "Vol_ratio": round(last["Vol_ratio"], 2),
+        "IV_spike": bool(last["IV_spike"]),
+        "Gamma_bias": gamma_bias
     })
 
-df_results = pd.DataFrame(results)
-st.dataframe(df_results, use_container_width=True)
+df_final = pd.DataFrame(results)
 
-st.subheader("Institutional Alerts")
+st.dataframe(df_final, use_container_width=True)
 
-alerts = df_results[df_results["Signal"] != "WAIT"]
+st.subheader("Institutional Alerts (≥75 only)")
+
+alerts = df_final[df_final["Confidence"] >= 75]
 
 if alerts.empty:
-    st.info("No institutional signals (confidence < 75).")
+    st.info("No institutional signals right now.")
 else:
-    for _, row in alerts.iterrows():
-        if "CALL" in row["Signal"]:
-            st.success(f"{row['Ticker']} → {row['Signal']} | Confidence: {row['Confidence']}")
-        else:
-            st.error(f"{row['Ticker']} → {row['Signal']} | Confidence: {row['Confidence']}")
+    st.dataframe(alerts, use_container_width=True)
 
