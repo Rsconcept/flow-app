@@ -5,19 +5,14 @@ import numpy as np
 import streamlit as st
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 from streamlit_autorefresh import st_autorefresh
 
-# =========================
-# SETTINGS / CONSTANTS
-# =========================
 st.set_page_config(page_title="Institutional Options Signals", layout="wide")
 
 CST = ZoneInfo("America/Chicago")
 
 DEFAULT_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "TSLA", "NVDA", "AMD"]
 
-# Your UW screener link (web view)
 UW_SCREENER_URL = (
     "https://unusualwhales.com/options-screener"
     "?close_greater_avg=true&exclude_ex_div_ticker=true&exclude_itm=true"
@@ -28,28 +23,18 @@ UW_SCREENER_URL = (
     "&order=premium&order_direction=desc"
 )
 
-# Secrets (Streamlit -> Settings -> Secrets)
+# ===== Secrets (MUST MATCH THESE NAMES) =====
 EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", os.getenv("EODHD_API_KEY", "")).strip()
 UW_TOKEN = st.secrets.get("UW_TOKEN", os.getenv("UW_TOKEN", "")).strip()
 
-# UW Flow Alerts endpoint (this is the one you want)
 UW_FLOW_ALERTS_URL = "https://api.unusualwhales.com/api/option-trade/flow-alerts"
 
-# =========================
-# TIME HELPERS
-# =========================
-def now_cst_dt():
+def now_cst():
     return datetime.now(CST)
 
 def now_cst_str():
-    return now_cst_dt().strftime("%Y-%m-%d %H:%M:%S")
+    return now_cst().strftime("%Y-%m-%d %H:%M:%S")
 
-def minutes_ago_cst(minutes: int):
-    return now_cst_dt() - timedelta(minutes=int(minutes))
-
-# =========================
-# SAFE HELPERS
-# =========================
 def safe_float(x):
     try:
         return float(x)
@@ -63,10 +48,9 @@ def ok_bad(label, ok: bool, detail: str = ""):
         st.error(f"{label} ❌ {detail}".strip())
 
 # =========================
-# EODHD DATA
+# EODHD
 # =========================
 def eodhd_intraday_5m(ticker: str, bars: int = 200):
-    # IMPORTANT: EODHD needs .US for US stocks/ETFs
     url = f"https://eodhd.com/api/intraday/{ticker}.US"
     params = {
         "api_token": EODHD_API_KEY,
@@ -85,39 +69,48 @@ def eodhd_intraday_5m(ticker: str, bars: int = 200):
     df.set_index("datetime", inplace=True)
     return df
 
-def eodhd_news(ticker: str, lookback_minutes: int = 60, limit: int = 20):
-    # EODHD news endpoint
-    # https://eodhd.com/financial-apis/news-api/
+def eodhd_news_safe(ticker: str, lookback_minutes: int = 60, limit: int = 20):
+    """
+    FIXED: EODHD News API sometimes rejects datetime strings.
+    Use DATE-ONLY format (YYYY-MM-DD). This is the most compatible.
+    """
     url = "https://eodhd.com/api/news"
-    start = minutes_ago_cst(lookback_minutes).astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
-    end = now_cst_dt().astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
+
+    start_date = (now_cst() - timedelta(minutes=int(lookback_minutes))).date().isoformat()
+    end_date = now_cst().date().isoformat()
 
     params = {
         "s": f"{ticker}.US",
-        "from": start,
-        "to": end,
+        "from": start_date,
+        "to": end_date,
         "limit": limit,
         "api_token": EODHD_API_KEY,
         "fmt": "json"
     }
+
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
-    if not data:
-        return []
-    return data
+    return data if isinstance(data, list) else []
 
-def eodhd_10y_yield():
-    # If this symbol doesn't work on your plan, we fail gracefully.
-    url = "https://eodhd.com/api/real-time/US10Y.BOND"
-    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    js = r.json()
-    return safe_float(js.get("close"))
+def eodhd_10y_yield_optional():
+    """
+    OPTIONAL 10Y: Some EODHD plans won't support US10Y.BOND.
+    We try, but if it fails we return None (and do NOT break the app).
+    """
+    try:
+        url = "https://eodhd.com/api/real-time/US10Y.BOND"
+        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        val = safe_float(js.get("close"))
+        return val if np.isfinite(val) else None
+    except:
+        return None
 
 # =========================
-# UNUSUAL WHALES DATA
+# UNUSUAL WHALES
 # =========================
 def uw_headers():
     return {
@@ -126,8 +119,6 @@ def uw_headers():
     }
 
 def uw_options_volume_bias(ticker: str):
-    # Correct endpoint you provided:
-    # https://api.unusualwhales.com/api/stock/{ticker}/options-volume
     url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-volume"
     r = requests.get(url, headers=uw_headers(), timeout=20)
     r.raise_for_status()
@@ -137,14 +128,10 @@ def uw_options_volume_bias(ticker: str):
     return js["data"][0]
 
 def uw_flow_alerts(limit: int = 200):
-    # Flow alerts endpoint (institutional triggers)
-    # Docs: PublicApi.OptionTradeController.flow_alerts
-    # Using the URL you provided
     params = {"limit": limit}
     r = requests.get(UW_FLOW_ALERTS_URL, headers=uw_headers(), params=params, timeout=20)
     r.raise_for_status()
     js = r.json()
-    # Some UW endpoints wrap in {"data":[...]} others return list; handle both
     if isinstance(js, dict) and "data" in js:
         return js["data"]
     if isinstance(js, list):
@@ -152,17 +139,15 @@ def uw_flow_alerts(limit: int = 200):
     return []
 
 def normalize_flow_alerts(alerts: list):
-    # Robust normalization (because UW fields vary by plan/version)
     rows = []
     for a in alerts:
         ticker = a.get("symbol") or a.get("underlying_symbol") or a.get("ticker") or ""
         premium = safe_float(a.get("premium") or a.get("total_premium") or a.get("notional") or 0)
         option_type = (a.get("option_type") or a.get("type") or "").lower()
-        side = (a.get("side") or "").lower()
+        executed_at = a.get("executed_at") or a.get("timestamp") or a.get("created_at") or ""
         expiry = a.get("expiry") or a.get("expiration") or None
         strike = safe_float(a.get("strike") or np.nan)
         underlying_price = safe_float(a.get("underlying_price") or a.get("stock_price") or np.nan)
-        executed_at = a.get("executed_at") or a.get("timestamp") or a.get("created_at") or ""
         tags = a.get("tags") or []
         if isinstance(tags, str):
             tags = [tags]
@@ -171,7 +156,6 @@ def normalize_flow_alerts(alerts: list):
             "ticker": ticker,
             "premium": premium,
             "type": option_type,
-            "side": side,
             "expiry": expiry,
             "strike": strike,
             "underlying_price": underlying_price,
@@ -181,25 +165,19 @@ def normalize_flow_alerts(alerts: list):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # Sort by biggest premium
-    df = df.sort_values("premium", ascending=False)
-    return df
+    return df.sort_values("premium", ascending=False)
 
 # =========================
-# TECHNICAL INDICATORS
+# INDICATORS
 # =========================
 def calc_indicators(df: pd.DataFrame):
     df = df.copy()
-
-    # EMA stack
     df["EMA9"] = df["close"].ewm(span=9).mean()
     df["EMA20"] = df["close"].ewm(span=20).mean()
     df["EMA50"] = df["close"].ewm(span=50).mean()
 
-    # VWAP (cumulative)
     df["VWAP"] = (df["close"] * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-9)
 
-    # RSI 14
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -208,32 +186,25 @@ def calc_indicators(df: pd.DataFrame):
     rs = avg_gain / (avg_loss + 1e-9)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD
     ema12 = df["close"].ewm(span=12).mean()
     ema26 = df["close"].ewm(span=26).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_signal"] = df["MACD"].ewm(span=9).mean()
     df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
 
-    # Volume ratio (20-bar)
     df["Vol_ratio"] = df["volume"] / (df["volume"].rolling(20).mean() + 1e-9)
 
-    # IV spike proxy via ATR expansion (simple + stable)
     tr = (df["high"] - df["low"]).abs()
     df["ATR"] = tr.rolling(14).mean()
     df["IV_spike"] = df["ATR"] > (df["ATR"].rolling(20).mean() * 1.5)
 
     return df
 
-# =========================
-# SCORE ENGINE (0–100 + CALL/PUT)
-# =========================
 def score_engine(df: pd.DataFrame, ticker: str, y10: float | None, uw_bias: dict | None):
     last = df.iloc[-1]
-
     score = 50.0
 
-    # Trend via EMA stack
+    # EMA trend
     if last["EMA9"] > last["EMA20"] > last["EMA50"]:
         score += 12
         trend_dir = "bull"
@@ -243,25 +214,19 @@ def score_engine(df: pd.DataFrame, ticker: str, y10: float | None, uw_bias: dict
     else:
         trend_dir = "neutral"
 
-    # VWAP bias
-    if last["close"] > last["VWAP"]:
-        score += 10
-    else:
-        score -= 10
+    # VWAP
+    score += 10 if last["close"] > last["VWAP"] else -10
 
-    # RSI bias
+    # RSI
     if last["RSI"] >= 55:
         score += 8
     elif last["RSI"] <= 45:
         score -= 8
 
-    # MACD histogram
-    if last["MACD_hist"] > 0:
-        score += 8
-    else:
-        score -= 8
+    # MACD hist
+    score += 8 if last["MACD_hist"] > 0 else -8
 
-    # Volume ratio (institutional participation)
+    # Volume ratio
     if last["Vol_ratio"] >= 1.5:
         score += 6
     elif last["Vol_ratio"] <= 0.8:
@@ -271,15 +236,14 @@ def score_engine(df: pd.DataFrame, ticker: str, y10: float | None, uw_bias: dict
     if bool(last["IV_spike"]):
         score += 5
 
-    # 10Y yield filter (risk-off sensitivity)
+    # 10Y yield (optional)
     if y10 is not None:
-        # Higher yields = pressure on growth / risk assets
         if y10 >= 4.2:
             score -= 6
         elif y10 <= 4.0:
             score += 6
 
-    # UW options volume premium bias (your requested endpoint)
+    # UW premium bias
     gamma_bias = "Neutral"
     uw_bias_str = "Neutral"
     if uw_bias:
@@ -297,7 +261,7 @@ def score_engine(df: pd.DataFrame, ticker: str, y10: float | None, uw_bias: dict
 
     score = float(np.clip(score, 0, 100))
 
-    # Calls / puts only decision
+    # Calls/Puts only
     if score >= 75:
         signal = "BUY CALLS"
         direction = "CALL"
@@ -329,11 +293,9 @@ def score_engine(df: pd.DataFrame, ticker: str, y10: float | None, uw_bias: dict
 st.title("🏛 Institutional Options Signals (5m) — CALLS / PUTS ONLY")
 st.caption(f"Last update (CST): {now_cst_str()}")
 
-# Auto refresh
 refresh_seconds = st.sidebar.slider("Auto-refresh (seconds)", 10, 300, 30, step=5)
 st_autorefresh(interval=refresh_seconds * 1000, key="auto_refresh")
 
-# Inputs
 with st.sidebar:
     st.header("Settings")
     tickers = st.multiselect("Tickers", DEFAULT_TICKERS, default=["SPY", "TSLA"])
@@ -341,221 +303,112 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Keys status (green/red)")
+    ok_bad("EODHD_API_KEY", bool(EODHD_API_KEY))
+    ok_bad("UW_TOKEN (Bearer)", bool(UW_TOKEN), "Fix Secrets name to UW_TOKEN" if not UW_TOKEN else "")
 
-    # Keys present?
-    ok_bad("EODHD_API_KEY", bool(EODHD_API_KEY), "(missing)" if not EODHD_API_KEY else "")
-    ok_bad("UW_TOKEN (Bearer)", bool(UW_TOKEN), "(missing)" if not UW_TOKEN else "")
-
-    st.caption("If a key is red, go Streamlit → App → Settings → Secrets.")
-
-# ======= API / Endpoint health checks (REAL checks) =======
+# Endpoint checks
 with st.sidebar:
     st.subheader("Endpoints status")
 
-    # EODHD intraday check (uses SPY as canary)
-    intraday_ok = False
-    intraday_err = ""
+    intraday_ok, intraday_err = False, ""
     if EODHD_API_KEY:
         try:
-            _df = eodhd_intraday_5m("SPY", bars=10)
-            intraday_ok = _df is not None and len(_df) > 5
+            _df = eodhd_intraday_5m("SPY", bars=20)
+            intraday_ok = _df is not None and len(_df) > 10
         except Exception as e:
-            intraday_err = str(e)[:80]
+            intraday_err = str(e)[:90]
     ok_bad("EODHD intraday", intraday_ok, intraday_err)
 
-    # EODHD news check
-    news_ok = False
-    news_err = ""
+    news_ok, news_err = False, ""
     if EODHD_API_KEY:
         try:
-            _n = eodhd_news("SPY", lookback_minutes=60, limit=3)
+            _n = eodhd_news_safe("SPY", lookback_minutes=60, limit=3)
             news_ok = isinstance(_n, list)
         except Exception as e:
-            news_err = str(e)[:80]
+            news_err = str(e)[:90]
     ok_bad("EODHD news", news_ok, news_err)
 
-    # 10Y check
-    y10_ok = False
-    y10_err = ""
-    y10_val = None
-    if EODHD_API_KEY:
-        try:
-            y10_val = eodhd_10y_yield()
-            y10_ok = y10_val is not None and np.isfinite(y10_val)
-        except Exception as e:
-            y10_err = str(e)[:80]
-    ok_bad("10Y yield", y10_ok, f"{y10_val:.2f}" if y10_ok else y10_err)
+    y10_val = eodhd_10y_yield_optional() if EODHD_API_KEY else None
+    ok_bad("10Y yield (optional)", y10_val is not None, f"{y10_val:.2f}" if y10_val is not None else "Not available (ok)")
 
-    # UW options-volume check
-    uw_vol_ok = False
-    uw_vol_err = ""
+    uw_vol_ok, uw_vol_err = False, ""
     if UW_TOKEN:
         try:
             _v = uw_options_volume_bias("SPY")
             uw_vol_ok = _v is not None
         except Exception as e:
-            uw_vol_err = str(e)[:80]
+            uw_vol_err = str(e)[:90]
     ok_bad("UW options-volume", uw_vol_ok, uw_vol_err)
 
-    # UW flow-alerts check
-    uw_flow_ok = False
-    uw_flow_err = ""
+    uw_flow_ok, uw_flow_err = False, ""
     if UW_TOKEN:
         try:
             _a = uw_flow_alerts(limit=5)
             uw_flow_ok = isinstance(_a, list)
         except Exception as e:
-            uw_flow_err = str(e)[:80]
+            uw_flow_err = str(e)[:90]
     ok_bad("UW flow-alerts", uw_flow_ok, uw_flow_err)
 
-# ======= Layout =======
 left, right = st.columns([1.25, 1])
 
-# LEFT: UW Screener web view (option flow)
 with left:
     st.subheader("Unusual Whales Screener (web view)")
-    st.caption("This is embedded. Use UW UI for filters: $1M+ premium, DTE<=3, stocks/ETFs only, exclude ITM, volume>OI.")
     st.components.v1.iframe(UW_SCREENER_URL, height=860, scrolling=True)
 
-# RIGHT: Score table + alerts + news + flow alerts
 with right:
     st.subheader("Live Score / Signals (EODHD price + EODHD headlines + UW flow)")
-
     if not tickers:
-        st.info("Pick at least 1 ticker in the left sidebar.")
+        st.info("Pick at least 1 ticker in the sidebar.")
         st.stop()
 
-    # Build table
     rows = []
-    debug_rows = []
-
     for t in tickers:
-        try:
-            df = eodhd_intraday_5m(t, bars=200)
-            if df is None or len(df) < 60:
-                debug_rows.append({"Ticker": t, "Reason": "intraday_not_enough_bars", "Bars": 0 if df is None else len(df)})
-                continue
+        df = eodhd_intraday_5m(t, bars=200) if EODHD_API_KEY else None
+        if df is None or len(df) < 60:
+            continue
+        df = calc_indicators(df)
+        uw_bias = uw_options_volume_bias(t) if UW_TOKEN else None
+        rows.append(score_engine(df, t, y10_val, uw_bias))
 
-            df = calc_indicators(df)
-
-            uw_bias = None
-            try:
-                uw_bias = uw_options_volume_bias(t) if UW_TOKEN else None
-            except:
-                uw_bias = None
-
-            row = score_engine(df, t, y10_val if y10_ok else None, uw_bias)
-            rows.append(row)
-
-            debug_rows.append({"Ticker": t, "Reason": "ok", "Bars": len(df)})
-
-        except Exception as e:
-            debug_rows.append({"Ticker": t, "Reason": f"error: {str(e)[:60]}", "Bars": 0})
-
-    score_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
-        "Ticker","Confidence","Direction","Signal","UW Bias","Gamma bias","RSI","MACD_hist","VWAP","EMA stack","Vol_ratio","IV spike"
-    ])
-
+    score_df = pd.DataFrame(rows)
     st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    # Institutional alerts >= 75
     st.subheader("Alerts (institutional)")
     inst = score_df[score_df["Confidence"] >= 75] if not score_df.empty else score_df
     if inst.empty:
-        st.info("No institutional signals (confidence < 75 for all tickers).")
+        st.info("No institutional signals (confidence < 75).")
     else:
         for _, r in inst.sort_values("Confidence", ascending=False).iterrows():
-            st.success(f"{r['Ticker']}: {r['Signal']} | Conf={r['Confidence']} | UW Bias={r['UW Bias']} | VWAP={r['VWAP']} | IV_spike={r['IV spike']}")
+            st.success(f"{r['Ticker']}: {r['Signal']} | Conf={r['Confidence']} | UW Bias={r['UW Bias']} | IV_spike={r['IV spike']}")
 
-    # UW Flow Alerts (live trigger feed)
     st.subheader("Unusual Flow Alerts (UW API)")
-    st.caption("This is the *API feed*. If UW endpoint returns nothing after-hours, this will be quiet.")
-
     if not UW_TOKEN:
-        st.warning("UW_TOKEN missing in Secrets.")
+        st.warning("UW_TOKEN missing in Secrets (fix name).")
     else:
-        try:
-            alerts_raw = uw_flow_alerts(limit=200)
-            alerts_df = normalize_flow_alerts(alerts_raw)
+        alerts_df = normalize_flow_alerts(uw_flow_alerts(limit=200))
+        if alerts_df.empty:
+            st.info("No flow alerts returned right now.")
+        else:
+            alerts_df = alerts_df[alerts_df["premium"] >= 1_000_000]
+            alerts_df = alerts_df[alerts_df["ticker"].isin(tickers)]
+            st.dataframe(alerts_df, use_container_width=True, hide_index=True)
 
-            # Filter your rules (best-effort; fields vary by plan)
-            # - Premium >= $1,000,000
-            # - Stocks/ETFs only: (not always labeled; we filter by ticker list)
-            # - DTE <= 3: needs expiry (optional)
-            # - Exclude ITM: needs strike & underlying (optional)
-            if not alerts_df.empty:
-                alerts_df = alerts_df[alerts_df["premium"] >= 1_000_000]
-
-                # Only show chosen tickers
-                alerts_df = alerts_df[alerts_df["ticker"].isin(tickers)]
-
-                # Add DTE if expiry present
-                def dte(exp):
-                    try:
-                        if not exp:
-                            return np.nan
-                        exp_dt = pd.to_datetime(exp).tz_localize(None)
-                        return (exp_dt.date() - now_cst_dt().date()).days
-                    except:
-                        return np.nan
-
-                alerts_df["DTE"] = alerts_df["expiry"].apply(dte)
-
-                # Apply DTE<=3 only if we have DTE
-                alerts_df = alerts_df[(alerts_df["DTE"].isna()) | (alerts_df["DTE"] <= 3)]
-
-                # Exclude ITM if we have enough fields
-                def is_itm(row):
-                    try:
-                        if np.isnan(row["strike"]) or np.isnan(row["underlying_price"]):
-                            return False
-                        if row["type"] == "call":
-                            return row["underlying_price"] > row["strike"]
-                        if row["type"] == "put":
-                            return row["underlying_price"] < row["strike"]
-                        return False
-                    except:
-                        return False
-
-                alerts_df = alerts_df[~alerts_df.apply(is_itm, axis=1)]
-
-                st.dataframe(
-                    alerts_df[["ticker","premium","type","side","DTE","strike","underlying_price","executed_at","tags"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.info("No flow alerts returned right now (normal after-hours, or your plan/endpoint may limit this feed).")
-
-        except Exception as e:
-            st.error(f"UW flow alerts error: {e}")
-
-    # News feed (EODHD)
     st.subheader(f"News — last {int(news_lookback)} minutes (EODHD)")
     if not EODHD_API_KEY:
-        st.warning("EODHD_API_KEY missing in Secrets.")
+        st.warning("EODHD_API_KEY missing.")
     else:
-        news_frames = []
+        news_rows = []
         for t in tickers:
-            try:
-                items = eodhd_news(t, lookback_minutes=int(news_lookback), limit=20)
-                for it in items:
-                    news_frames.append({
-                        "Ticker": t,
-                        "published": it.get("date") or it.get("published") or "",
-                        "Source": it.get("source") or "",
-                        "Title": it.get("title") or "",
-                        "URL": it.get("link") or it.get("url") or ""
-                    })
-            except:
-                pass
-
-        if not news_frames:
-            st.info("No news in this lookback window (or feed returned none).")
+            items = eodhd_news_safe(t, lookback_minutes=int(news_lookback), limit=20)
+            for it in items:
+                news_rows.append({
+                    "Ticker": t,
+                    "published": it.get("date") or it.get("published") or "",
+                    "Source": it.get("source") or "",
+                    "Title": it.get("title") or "",
+                    "URL": it.get("link") or it.get("url") or ""
+                })
+        if not news_rows:
+            st.info("No news returned in this window.")
         else:
-            news_df = pd.DataFrame(news_frames)
-            st.dataframe(news_df[["Ticker","published","Source","Title","URL"]], use_container_width=True, hide_index=True)
-
-    # Debug (why None)
-    with st.expander("Debug (why indicators might be None)"):
-        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(news_rows), use_container_width=True, hide_index=True)
