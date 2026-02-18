@@ -31,7 +31,6 @@ UW_SCREENER_URL = (
 EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", os.getenv("EODHD_API_KEY", "")).strip()
 UW_TOKEN      = st.secrets.get("UW_TOKEN", os.getenv("UW_TOKEN", "")).strip()
 
-# if user has it; might still be blocked by plan, we show status but don't crash
 UW_FLOW_ALERTS_URL = st.secrets.get(
     "UW_FLOW_ALERTS_URL",
     os.getenv("UW_FLOW_ALERTS_URL", "https://api.unusualwhales.com/api/option-trade/flow-alerts")
@@ -132,8 +131,12 @@ def eodhd_intraday(symbol_us: str, interval="5m", lookback_minutes=240):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["close"]).copy()
 
-        if df.empty or len(df) < 30:
-            return pd.DataFrame(), "insufficient_bars"
+        if df.empty:
+            return pd.DataFrame(), "ticker_data_empty"
+
+        # Need enough bars to compute indicators reliably
+        if len(df) < 30:
+            return df, "insufficient_bars"
 
         return df, "ok"
 
@@ -230,7 +233,6 @@ def uw_options_volume_bias(ticker: str):
 
 @st.cache_data(ttl=30)
 def uw_flow_alerts(limit: int = 200):
-    """Optional: may be blocked by plan; keep app running."""
     if not UW_TOKEN:
         return [], "missing_token"
 
@@ -248,90 +250,20 @@ def uw_flow_alerts(limit: int = 200):
     except Exception:
         return [], "error"
 
-@st.cache_data(ttl=30)
-def uw_option_contract_intraday(contract_id: str):
-    """YOUR FIX: uses /api/option-contract/{id}/intraday"""
-    if not UW_TOKEN:
-        return pd.DataFrame(), "missing_token"
-
-    cid = contract_id.strip()
-    if not cid:
-        return pd.DataFrame(), "missing_id"
-
-    url = f"https://api.unusualwhales.com/api/option-contract/{cid}/intraday"
-    headers = {"Accept": "application/json, text/plain", "Authorization": f"Bearer {UW_TOKEN}"}
-
-    try:
-        data = http_get_json(url, headers=headers)
-        rows = data.get("data", [])
-        if not rows:
-            return pd.DataFrame(), "no_data"
-        df = pd.DataFrame(rows)
-
-        # normalize time
-        if "start_time" in df.columns:
-            df["start_time"] = pd.to_datetime(df["start_time"], errors="coerce", utc=True).dt.tz_convert(CST)
-
-        # numeric
-        num_cols = [
-            "avg_price","open","high","low","close",
-            "iv_high","iv_low",
-            "premium_ask_side","premium_bid_side","premium_mid_side","premium_no_side",
-            "volume_ask_side","volume_bid_side","volume_mid_side","volume_multi","volume_no_side"
-        ]
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        df = df.sort_values("start_time") if "start_time" in df.columns else df
-        return df, "ok"
-
-    except requests.HTTPError as e:
-        return pd.DataFrame(), f"http_{e.response.status_code}"
-    except Exception:
-        return pd.DataFrame(), "error"
-
-
-def contract_iv_spike(df: pd.DataFrame):
-    """IV spike from contract intraday (real)."""
-    if df is None or df.empty or "iv_high" not in df.columns:
-        return None, None
-    iv = df["iv_high"].dropna()
-    if len(iv) < 20:
-        return None, None
-    current = float(iv.iloc[-1])
-    base = float(iv.tail(120).median()) if len(iv) >= 40 else float(iv.median())
-    spike = bool(base > 0 and current > base * 1.25 and current > 0.30)
-    return spike, round(current, 4)
-
-def contract_pressure(df: pd.DataFrame):
-    """Ask vs Bid premium/volume pressure (bullish if ask dominates, bearish if bid dominates)."""
-    if df is None or df.empty:
-        return 0.0
-    pa = df.get("premium_ask_side", pd.Series(dtype=float)).dropna()
-    pb = df.get("premium_bid_side", pd.Series(dtype=float)).dropna()
-    va = df.get("volume_ask_side", pd.Series(dtype=float)).dropna()
-    vb = df.get("volume_bid_side", pd.Series(dtype=float)).dropna()
-
-    pA = float(pa.sum()) if len(pa) else 0.0
-    pB = float(pb.sum()) if len(pb) else 0.0
-    vA = float(va.sum()) if len(va) else 0.0
-    vB = float(vb.sum()) if len(vb) else 0.0
-
-    # blend premium + volume dominance
-    prem_total = max(pA + pB, 1.0)
-    vol_total  = max(vA + vB, 1.0)
-
-    prem_bias = (pA - pB) / prem_total
-    vol_bias  = (vA - vB) / vol_total
-
-    return float(clamp(0.7 * prem_bias + 0.3 * vol_bias, -1.0, 1.0))
-
 
 # ---------------- scoring ----------------
-def score_ticker(df_5m: pd.DataFrame, *, uw_vol=None, news_df=None, contract_flow_bias=0.0, contract_iv_spike_flag=None, weights=None):
+def score_ticker(df_5m: pd.DataFrame, *, uw_vol=None, news_df=None, weights=None):
+    # If we have NO bars or too few bars -> explain it clearly.
     if df_5m is None or df_5m.empty:
-        return {"confidence": 50, "direction": "—", "signal": "WAIT"}
+        return {"confidence": 50, "direction": "—", "signal": "WAIT", "reason": "No intraday bars returned for this window."}
+
+    if len(df_5m) < 30:
+        last_dt = df_5m["datetime"].iloc[-1] if "datetime" in df_5m.columns else None
+        last_dt_s = fmt_cst(last_dt) if last_dt is not None else "unknown"
+        return {
+            "confidence": 50, "direction": "—", "signal": "WAIT",
+            "reason": f"Not enough 5m bars to compute indicators (bars={len(df_5m)}; last={last_dt_s})."
+        }
 
     close = df_5m["close"]
     df = df_5m.copy()
@@ -381,10 +313,7 @@ def score_ticker(df_5m: pd.DataFrame, *, uw_vol=None, news_df=None, contract_flo
     uw_comp = max(-1.0, min(1.0, uw_bias))
     news_comp = max(-1.0, min(1.0, ns))
 
-    # contract_flow_bias is already -1..+1 (ask vs bid pressure)
-    contract_comp = max(-1.0, min(1.0, contract_flow_bias))
-
-    w = weights or {"vwap":0.18,"ema":0.18,"rsi":0.15,"macd":0.15,"vol":0.12,"uw":0.18,"contract":0.25,"news":0.05}
+    w = weights or {"vwap":0.20,"ema":0.20,"rsi":0.15,"macd":0.15,"vol":0.10,"uw":0.15,"news":0.05}
 
     raw = (
         w["vwap"]*vwap_comp +
@@ -393,7 +322,6 @@ def score_ticker(df_5m: pd.DataFrame, *, uw_vol=None, news_df=None, contract_flo
         w["macd"]*macd_comp +
         w["vol"]*vol_comp +
         w["uw"]*uw_comp +
-        w["contract"]*contract_comp +
         w["news"]*news_comp
     )
 
@@ -419,12 +347,10 @@ def score_ticker(df_5m: pd.DataFrame, *, uw_vol=None, news_df=None, contract_flo
         "MACD_hist": round(macd_h, 4),
         "VWAP": "Above" if vwap_above else "Below",
         "EMA_stack": "Bull" if ema_bull else ("Bear" if ema_bear else "Neutral"),
-        "Vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+        "Vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else "N/A",
         "UW_bias": round(uw_comp, 2),
-        "Put/Call vol": put_call_vol,
-        "Contract_pressure": round(contract_comp, 2),
-        "IV_spike": ("YES" if contract_iv_spike_flag else "NO") if contract_iv_spike_flag is not None else "N/A",
-        "Gamma_bias": "N/A (needs gamma source)",
+        "Put/Call vol": round(put_call_vol, 2) if isinstance(put_call_vol, (int, float)) else "N/A",
+        "reason": "ok"
     }
 
 
@@ -433,7 +359,7 @@ with st.sidebar:
     st.header("Settings")
 
     st.caption("Type any tickers (comma-separated). Example: SPY,TSLA,NVDA")
-    raw = st.text_input("Tickers", value="SPY,TSLA")
+    raw = st.text_input("Tickers", value="TSLA")
     quick = st.multiselect("Quick pick (optional)", DEFAULT_QUICK, default=[])
 
     typed = [t.strip().upper() for t in raw.split(",") if t.strip()]
@@ -443,12 +369,6 @@ with st.sidebar:
             tickers.append(t)
 
     st.divider()
-
-    st.caption("OPTION CONTRACT IDS (optional). Paste UUIDs (comma-separated).")
-    st.caption("Example: 8ef90a2d-d881-41de-98c9-c1de4318dcb5")
-    raw_contract_ids = st.text_input("Contract IDs", value="")
-
-    contract_ids = [c.strip() for c in raw_contract_ids.split(",") if c.strip()]
 
     news_lookback = st.number_input("News lookback (minutes)", min_value=1, max_value=240, value=60, step=1)
     price_lookback = st.number_input("Price lookback (minutes)", min_value=60, max_value=1440, value=240, step=30)
@@ -472,8 +392,6 @@ with st.sidebar:
     pill("UW_TOKEN (Bearer)", bool(UW_TOKEN), "(missing)")
     pill("UW_FLOW_ALERTS_URL", bool(UW_FLOW_ALERTS_URL), "(missing)")
 
-    st.caption("Flow-alerts may still be 404 if your UW plan doesn’t allow it. Contract intraday usually works.")
-
 
 # ---------------- autorefresh ----------------
 if HAS_AUTOREFRESH:
@@ -485,7 +403,7 @@ st.title("🏛️ Institutional Options Signals (5m) — CALLS / PUTS ONLY")
 st.write(f"Last update (CST): **{fmt_cst(now_cst())}**")
 
 if not tickers:
-    st.warning("Type at least one ticker in the sidebar (example: SPY,TSLA).")
+    st.warning("Type at least one ticker in the sidebar (example: TSLA).")
     st.stop()
 
 left, right = st.columns([1.15, 1])
@@ -496,13 +414,10 @@ with left:
     st.components.v1.iframe(UW_SCREENER_URL, height=850, scrolling=True)
 
 with right:
-    st.subheader("Live Score / Signals (EODHD price + EODHD headlines + UW contract intraday)")
-
-    # Optional: flow-alerts (may be blocked)
+    st.subheader("Endpoints status")
     flow_rows, flow_status = uw_flow_alerts(limit=200)
 
-    st.markdown("### Endpoints status")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         st.success("EODHD ✅" if EODHD_API_KEY else "EODHD ❌")
     with c2:
@@ -510,39 +425,9 @@ with right:
             st.success("UW flow-alerts ✅")
         else:
             st.warning(f"UW flow-alerts ⚠️ ({flow_status})")
-            st.caption("If http_404: plan/endpoint access. App will still work using contract intraday.")
-    with c3:
-        st.success("UW contract intraday ✅ (if IDs provided)" if UW_TOKEN else "UW ❌ (missing token)")
 
-    # Pull contract intraday (optional)
-    contract_tables = []
-    contract_pressure_bias = 0.0
-    contract_iv_spike_flag = None
+    st.subheader("Live Score / Signals (EODHD price + EODHD headlines + UW options-volume)")
 
-    if contract_ids:
-        for cid in contract_ids[:8]:  # safety cap
-            df_c, st_c = uw_option_contract_intraday(cid)
-            if st_c == "ok" and not df_c.empty:
-                spike, iv_now = contract_iv_spike(df_c)
-                press = contract_pressure(df_c)
-
-                contract_pressure_bias += press
-
-                # any spike flips the flag true
-                if contract_iv_spike_flag is None:
-                    contract_iv_spike_flag = bool(spike)
-                else:
-                    contract_iv_spike_flag = contract_iv_spike_flag or bool(spike)
-
-                show = df_c.copy()
-                show["contract_id"] = cid
-                if "start_time" in show.columns:
-                    show["start_time_cst"] = show["start_time"].dt.strftime("%Y-%m-%d %H:%M:%S CST")
-                contract_tables.append(show)
-
-        contract_pressure_bias = contract_pressure_bias / max(len(contract_tables), 1)
-
-    # Build output rows
     rows = []
     news_frames = []
 
@@ -550,6 +435,9 @@ with right:
         symbol_us = f"{t}.US"
 
         bars, bars_status = eodhd_intraday(symbol_us, interval="5m", lookback_minutes=int(price_lookback))
+        bars_count = int(len(bars)) if isinstance(bars, pd.DataFrame) else 0
+        last_bar = fmt_cst(bars["datetime"].iloc[-1]) if bars_count and "datetime" in bars.columns else "N/A"
+
         ndf, news_status = eodhd_news(symbol_us, lookback_minutes=int(news_lookback), limit=50)
         if news_status == "ok" and not ndf.empty:
             ndf2 = ndf.copy()
@@ -562,28 +450,29 @@ with right:
             bars,
             uw_vol=uwv if uwv_status == "ok" else None,
             news_df=ndf if news_status == "ok" else None,
-            contract_flow_bias=contract_pressure_bias,
-            contract_iv_spike_flag=contract_iv_spike_flag,
         )
+
+        def na(x):
+            return "N/A" if (x is None or (isinstance(x, float) and pd.isna(x))) else x
 
         rows.append({
             "Ticker": t,
-            "Confidence": res["confidence"],
-            "Direction": res["direction"],
-            "Signal": res["signal"],
-            "RSI": res.get("RSI"),
-            "MACD_hist": res.get("MACD_hist"),
-            "VWAP": res.get("VWAP"),
-            "EMA_stack": res.get("EMA_stack"),
-            "Vol_ratio": res.get("Vol_ratio"),
-            "UW_bias": res.get("UW_bias"),
-            "Put/Call vol": res.get("Put/Call vol"),
-            "Contract_pressure": res.get("Contract_pressure"),
-            "IV_spike": res.get("IV_spike"),
-            "Gamma_bias": res.get("Gamma_bias"),
-            "EODHD bars": bars_status,
-            "EODHD news": news_status,
-            "UW opt-vol": uwv_status,
+            "Confidence": res.get("confidence", 50),
+            "Direction": res.get("direction", "—"),
+            "Signal": res.get("signal", "WAIT"),
+            "RSI": na(res.get("RSI")),
+            "MACD_hist": na(res.get("MACD_hist")),
+            "VWAP": na(res.get("VWAP")),
+            "EMA_stack": na(res.get("EMA_stack")),
+            "Vol_ratio": na(res.get("Vol_ratio")),
+            "UW_bias": na(res.get("UW_bias")),
+            "Put/Call vol": na(res.get("Put/Call vol")),
+            "Bars": bars_count,
+            "Last bar (CST)": last_bar,
+            "EODHD bars status": bars_status,
+            "EODHD news status": news_status,
+            "UW opt-vol status": uwv_status,
+            "Reason": res.get("reason", "ok"),
         })
 
     df_out = pd.DataFrame(rows)
@@ -595,18 +484,7 @@ with right:
         st.info("No institutional signals right now.")
     else:
         for _, r in inst.sort_values("Confidence", ascending=False).iterrows():
-            st.success(f"{r['Ticker']}: {r['Signal']} | {r['Direction']} | Confidence={r['Confidence']} | IV spike={r['IV_spike']}")
-
-    st.markdown("### UW Option Contract Intraday (paste Contract IDs in sidebar)")
-    if not contract_ids:
-        st.info("Paste one or more UW option contract UUIDs in the sidebar to activate this section.")
-    else:
-        if contract_tables:
-            combined = pd.concat(contract_tables, ignore_index=True)
-            cols = [c for c in ["contract_id","option_symbol","start_time_cst","premium_ask_side","premium_bid_side","volume_ask_side","volume_bid_side","iv_high","iv_low","close"] if c in combined.columns]
-            st.dataframe(combined[cols].tail(120), use_container_width=True, hide_index=True)
-        else:
-            st.warning("No intraday data returned for the provided contract IDs (check IDs and token access).")
+            st.success(f"{r['Ticker']}: {r['Signal']} | {r['Direction']} | Confidence={r['Confidence']}")
 
     st.markdown(f"### News — last {int(news_lookback)} minutes (EODHD)")
     if news_frames:
@@ -617,7 +495,6 @@ with right:
     else:
         st.info("No news in this lookback window (or EODHD returned none).")
 
-    with st.expander("Debug / API error advice"):
-        st.write("**If UW flow-alerts is 404** → that’s usually plan/scope access. Your code can’t fix that.")
-        st.write("**Contract intraday works only if you provide contract UUID IDs** (grab from Network tab).")
-        st.write("**If EODHD intraday says ticker_data_empty** → try another ticker or confirm it exists as TICKER.US on EODHD.")
+    with st.expander("What 'None/N/A' means (plain English)"):
+        st.write("If RSI/MACD/VWAP/EMA/Vol_ratio show N/A, it means EODHD did not return enough 5-minute bars in your lookback window.")
+        st.write("Common reasons: after-hours, holiday/weekend, too small lookback, or ticker not returning bars from EODHD.")
