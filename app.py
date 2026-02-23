@@ -1,792 +1,1298 @@
-# app.py
-# Institutional Options Signals (5m) — CALLS / PUTS ONLY
-# Uses: EODHD intraday + EODHD news + EODHD options chain + Unusual Whales flow alerts + FRED 10Y
-# After-hours safe: will show "empty" instead of crashing.
+#!/usr/bin/env python3
+"""
+v3.1 Options Flow Scanner (UW + Polygon + EODHD) with:
+- Live/Replay toggle (snapshot)
+- Polygon intraday spot-at-time (minute bars) + fallback to prev close
+- EODHD options chain IV (current IV)
+- Local IV history store (free IV ramp by saving daily IV per contract)
+- Clear Endpoint Status panel
 
-import os
-import time
-import math
+requirements.txt:
+streamlit
+requests
+
+Streamlit Secrets:
+UW_TOKEN="..."
+POLYGON_API_KEY="..."
+EODHD_API_KEY="..."
+"""
+
+from __future__ import annotations
+
 import json
+import os
+from datetime import datetime, timedelta, timezone, date
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+# -------------------- Constants --------------------
+
+CT_OFFSET = -6  # Central Time offset
+MAX_PENDING_TRADES = 50
+
+PENDING_TRADES_FILE = "pending_trades.json"
+INVERSE_SIGNALS_FILE = "inverse_signals.json"
+VALIDATED_TRADES_FILE = "validated_trades.json"
+
+SNAPSHOT_FILE = "last_uw_flows.json"
+IV_STORE_FILE = "iv_history_store.json"
+
+EXCLUDED_TICKERS_DEFAULT = {
+    # Indexes
+    "SPX", "SPXW", "NDX", "VIX", "RUT", "DJX", "XSP", "OEX",
+    # Index ETFs
+    "SPY", "QQQ", "IWM", "DIA",
+    # Sector ETFs
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
+}
+
+# -------------------- Helpers --------------------
 
 
-# =========================
-# Config
-# =========================
-APP_TZ = ZoneInfo("America/Chicago")  # CST/CDT automatically
-EODHD_BASE = "https://eodhd.com/api"
-UW_BASE = "https://api.unusualwhales.com/api"
-FRED_BASE = "https://api.stlouisfed.org/fred"
-
-DEFAULT_TICKERS = "SPY,TSLA,NVDA,QQQ,IWM,DIA,AMD,META"
-DEFAULT_NEWS_LOOKBACK_MIN = 60
-DEFAULT_PRICE_LOOKBACK_MIN = 240
-DEFAULT_REFRESH_SEC = 30
-
-# UW filtering rules you requested
-MIN_PREMIUM_USD = 1_000_000
-MAX_DTE_DAYS = 3
-
-
-# =========================
-# Helpers
-# =========================
-def now_cst() -> datetime:
-    return datetime.now(tz=APP_TZ)
-
-def to_unix_seconds(dt: datetime) -> int:
-    return int(dt.timestamp())
-
-def safe_float(x):
+def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        if s == "" or s.lower() in ("none", "nan", "null"):
-            return None
-        return float(s)
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def http_get(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> Tuple[int, Optional[Any], str]:
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code == 200:
+            try:
+                return resp.status_code, resp.json(), ""
+            except Exception:
+                return resp.status_code, None, "Failed to parse JSON."
+        return resp.status_code, None, f"HTTP {resp.status_code}: {resp.text[:400]}"
+    except Exception as e:
+        return 0, None, f"Request error: {e}"
+
+
+def ensure_json_file(path: str, default_value: Any) -> None:
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default_value, f, indent=2)
+
+
+def read_json_file(path: str, default: Any) -> Any:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json_file(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def today_yyyy_mm_dd() -> str:
+    return date.today().strftime("%Y-%m-%d")
+
+
+def pretty_money(x: float) -> str:
+    try:
+        return f"${x:,.0f}"
+    except Exception:
+        return str(x)
+
+
+def calculate_dte(expiry_yyyy_mm_dd: str) -> int:
+    try:
+        exp_date = datetime.strptime(expiry_yyyy_mm_dd, "%Y-%m-%d")
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return (exp_date - today).days
+    except Exception:
+        return 0
+
+
+def to_central_time(iso_timestamp: str, ct_offset_hours: int = CT_OFFSET) -> str:
+    """Convert ISO timestamp to 'YYYY-MM-DD HH:MM:SS AM CT'. If parsing fails, return raw."""
+    if not iso_timestamp:
+        return ""
+    try:
+        if "T" in iso_timestamp:
+            dt = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(iso_timestamp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        ct = dt + timedelta(hours=ct_offset_hours)
+        return ct.strftime("%Y-%m-%d %I:%M:%S %p CT")
+    except Exception:
+        return iso_timestamp
+
+
+def parse_uw_time_to_utc(iso_timestamp: str) -> Optional[datetime]:
+    """UW timestamps are usually ISO with Z. Return aware UTC dt."""
+    if not iso_timestamp:
+        return None
+    try:
+        if "T" in iso_timestamp:
+            dt = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        dt = datetime.strptime(iso_timestamp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
-def is_market_hours_cst(dt: datetime) -> bool:
-    # US equities: 8:30–15:00 CST (9:30–16:00 ET) Mon–Fri
-    if dt.weekday() >= 5:
-        return False
-    open_cst = dt.replace(hour=8, minute=30, second=0, microsecond=0)
-    close_cst = dt.replace(hour=15, minute=0, second=0, microsecond=0)
-    return open_cst <= dt <= close_cst
-
-def parse_tickers(text: str) -> list[str]:
-    # Allow ANY ticker typed by user
-    raw = (text or "").upper().replace(";", ",").replace("\n", ",")
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    # de-dup preserving order
-    seen = set()
-    out = []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-def normalize_iv(iv_value):
-    """
-    Fix insane IV numbers.
-    - Some feeds return 0.3154 (31.54%)
-    - Some return 31.54 (already %)
-    - Some bad parses produce 3154 or 3719.49 -> treat as percent*100
-    """
-    iv = safe_float(iv_value)
-    if iv is None:
-        return None
-    # If it's clearly a fraction
-    if 0 < iv < 3:
-        return iv * 100.0
-    # If it's already a reasonable percent
-    if 3 <= iv <= 250:
-        return iv
-    # If it's huge, assume it's percent * 100
-    if iv > 250:
-        return iv / 100.0
-    return None
+def contract_key(ticker: str, expiry: str, option_type: str, strike: float) -> str:
+    return f"{ticker.upper()}|{expiry}|{option_type.lower()}|{float(strike):.2f}"
 
 
-# =========================
-# HTTP wrappers
-# =========================
-@dataclass
-class EndpointResult:
-    ok: bool
-    status: str
-    data: any = None
-    error: str = ""
+# -------------------- Snapshot Manager --------------------
 
-def http_get_json(url: str, headers=None, timeout=20) -> EndpointResult:
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        status = f"http_{r.status_code}"
-        if r.status_code != 200:
-            # try to show server message (often helpful)
-            msg = ""
-            try:
-                msg = r.text[:500]
-            except Exception:
-                pass
-            return EndpointResult(False, status, None, msg)
+
+class SnapshotManager:
+    def __init__(self, path: str = SNAPSHOT_FILE):
+        self.path = path
+
+    def save(self, flows: List[Dict[str, Any]]) -> None:
+        payload = {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "count": len(flows),
+            "flows": flows,
+        }
+        write_json_file(self.path, payload)
+
+    def load(self) -> List[Dict[str, Any]]:
+        payload = read_json_file(self.path, {})
+        if isinstance(payload, dict) and isinstance(payload.get("flows"), list):
+            return payload["flows"]
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def get_meta(self) -> Dict[str, Any]:
+        payload = read_json_file(self.path, {})
+        if isinstance(payload, dict):
+            return {
+                "saved_at_utc": payload.get("saved_at_utc"),
+                "count": payload.get("count"),
+            }
+        return {}
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def raw_text(self) -> str:
+        if not self.exists():
+            return ""
         try:
-            return EndpointResult(True, "ok", r.json(), "")
-        except Exception as e:
-            return EndpointResult(False, "parse_error", None, f"{e} | body[:200]={r.text[:200]}")
-    except Exception as e:
-        return EndpointResult(False, "request_error", None, str(e))
+            with open(self.path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
 
 
-# =========================
-# Data: EODHD
-# =========================
-@st.cache_data(ttl=25)
-def eodhd_intraday_bars(ticker: str, lookback_minutes: int, interval: str, eodhd_key: str) -> EndpointResult:
+# -------------------- Local IV Store --------------------
+
+
+class LocalIVStore:
     """
-    EODHD intraday endpoint expects UNIX from/to (numbers) -> fixes your 422.
-    """
-    if not eodhd_key:
-        return EndpointResult(False, "missing_key", None, "EODHD_API_KEY missing")
-
-    t = ticker.upper().strip()
-    dt_to = now_cst()
-    dt_from = dt_to - timedelta(minutes=int(lookback_minutes))
-
-    url = (
-        f"{EODHD_BASE}/intraday/{t}.US"
-        f"?api_token={eodhd_key}&fmt=json"
-        f"&interval={interval}"
-        f"&from={to_unix_seconds(dt_from)}"
-        f"&to={to_unix_seconds(dt_to)}"
-    )
-
-    res = http_get_json(url)
-    if not res.ok:
-        return res
-
-    rows = res.data if isinstance(res.data, list) else []
-    if not rows:
-        return EndpointResult(True, "empty", [], "No intraday bars returned for this window")
-
-    df = pd.DataFrame(rows)
-    # EODHD commonly returns: datetime, open, high, low, close, volume
-    # Normalize datetime
-    if "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce").dt.tz_convert(APP_TZ)
-    elif "date" in df.columns:
-        df["datetime"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_convert(APP_TZ)
-
-    # Ensure numeric
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["datetime"]).sort_values("datetime")
-    return EndpointResult(True, "ok", df, "")
-
-
-@st.cache_data(ttl=60)
-def eodhd_news(ticker: str, lookback_minutes: int, eodhd_key: str) -> EndpointResult:
-    if not eodhd_key:
-        return EndpointResult(False, "missing_key", None, "EODHD_API_KEY missing")
-
-    t = ticker.upper().strip()
-    # EODHD news endpoint varies by plan; this one is commonly used:
-    # /news?s=TSLA.US&offset=0&limit=50
-    url = f"{EODHD_BASE}/news?s={t}.US&offset=0&limit=50&api_token={eodhd_key}&fmt=json"
-    res = http_get_json(url)
-    if not res.ok:
-        return res
-
-    items = res.data if isinstance(res.data, list) else []
-    if not items:
-        return EndpointResult(True, "ok", pd.DataFrame(), "")
-
-    df = pd.DataFrame(items)
-
-    # Try to standardize columns (EODHD sometimes uses different keys)
-    col_map = {
-        "date": "published",
-        "datetime": "published",
-        "publishedAt": "published",
-        "title": "title",
-        "source": "source",
-        "link": "url",
-        "url": "url",
+    Stores IV history per contract in JSON:
+    {
+      "AAPL|2026-03-20|call|200.00": [{"date":"2026-02-10","iv":45.2}, ...],
+      ...
     }
-    for k, v in col_map.items():
-        if k in df.columns and v not in df.columns:
-            df[v] = df[k]
-
-    if "published" in df.columns:
-        dt = pd.to_datetime(df["published"], utc=True, errors="coerce")
-        df["published_cst"] = dt.dt.tz_convert(APP_TZ)
-    else:
-        df["published_cst"] = pd.NaT
-
-    cutoff = now_cst() - timedelta(minutes=int(lookback_minutes))
-    df = df[df["published_cst"].isna() | (df["published_cst"] >= cutoff)]
-    df = df.sort_values("published_cst", ascending=False)
-
-    return EndpointResult(True, "ok", df, "")
-
-
-@st.cache_data(ttl=60)
-def eodhd_options_chain(ticker: str, eodhd_key: str) -> EndpointResult:
     """
-    Gives IV_now (single snapshot) + Put/Call volume + Put/Call OI for expiries within MAX_DTE_DAYS.
-    """
-    if not eodhd_key:
-        return EndpointResult(False, "missing_key", None, "EODHD_API_KEY missing")
 
-    t = ticker.upper().strip()
-    url = f"{EODHD_BASE}/options/{t}.US?api_token={eodhd_key}&fmt=json"
-    res = http_get_json(url)
-    if not res.ok:
-        return res
-
-    data = res.data
-    if not isinstance(data, dict):
-        return EndpointResult(False, "parse_error", None, "Options chain not a dict")
-
-    # EODHD returns dict keyed by expiry date often
-    rows = []
-    for exp, contracts in data.items():
-        if isinstance(contracts, list):
-            for c in contracts:
-                c2 = dict(c)
-                c2["expiration"] = exp
-                rows.append(c2)
-
-    if not rows:
-        return EndpointResult(True, "ok", pd.DataFrame(), "")
-
-    df = pd.DataFrame(rows)
-
-    # Standardize
-    if "type" not in df.columns and "optionType" in df.columns:
-        df["type"] = df["optionType"]
-
-    for c in ["openInterest", "volume", "strike", "impliedVolatility"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["expiration"] = pd.to_datetime(df["expiration"], errors="coerce").dt.date
-    today = now_cst().date()
-    df["dte"] = df["expiration"].apply(lambda d: (d - today).days if pd.notna(d) else None)
-
-    # Keep <= MAX_DTE_DAYS (your rule)
-    df = df[(df["dte"].notna()) & (df["dte"] >= 0) & (df["dte"] <= MAX_DTE_DAYS)]
-
-    return EndpointResult(True, "ok", df, "")
-
-
-# =========================
-# Data: Unusual Whales
-# =========================
-@st.cache_data(ttl=10)
-def uw_flow_alerts(limit: int, uw_token: str) -> EndpointResult:
-    if not uw_token:
-        return EndpointResult(False, "missing_key", None, "UW_TOKEN missing")
-
-    headers = {
-        "Accept": "application/json, text/plain",
-        "Authorization": f"Bearer {uw_token}",
-    }
-    # per your spec:
-    # GET /option-trades/flow-alerts?limit=100
-    url = f"{UW_BASE}/option-trades/flow-alerts?limit={int(limit)}"
-    res = http_get_json(url, headers=headers)
-    if not res.ok:
-        return res
-
-    payload = res.data
-    items = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if not isinstance(items, list):
-        return EndpointResult(False, "parse_error", None, "UW flow alerts not a list")
-
-    df = pd.DataFrame(items)
-    return EndpointResult(True, "ok", df, "")
-
-
-# =========================
-# Indicators
-# =========================
-def calc_vwap(df: pd.DataFrame) -> float | None:
-    if df is None or df.empty:
-        return None
-    if not all(c in df.columns for c in ["close", "volume"]):
-        return None
-    pv = (df["close"] * df["volume"]).sum()
-    vv = df["volume"].sum()
-    if vv == 0:
-        return None
-    return float(pv / vv)
-
-def calc_ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def calc_rsi(close: pd.Series, period: int = 14) -> float | None:
-    if close is None or len(close) < period + 2:
-        return None
-    delta = close.diff()
-    up = delta.clip(lower=0).rolling(period).mean()
-    down = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = up / down.replace(0, math.nan)
-    rsi = 100 - (100 / (1 + rs))
-    v = rsi.iloc[-1]
-    return None if pd.isna(v) else float(v)
-
-def calc_macd_hist(close: pd.Series) -> float | None:
-    if close is None or len(close) < 35:
-        return None
-    ema12 = calc_ema(close, 12)
-    ema26 = calc_ema(close, 26)
-    macd = ema12 - ema26
-    signal = calc_ema(macd, 9)
-    hist = macd - signal
-    v = hist.iloc[-1]
-    return None if pd.isna(v) else float(v)
-
-def calc_vol_ratio(df: pd.DataFrame, window: int = 20) -> float | None:
-    if df is None or df.empty or "volume" not in df.columns or len(df) < window + 1:
-        return None
-    cur = df["volume"].iloc[-1]
-    avg = df["volume"].iloc[-window:].mean()
-    if avg == 0 or pd.isna(avg) or pd.isna(cur):
-        return None
-    return float(cur / avg)
-
-def ema_stack_bias(df: pd.DataFrame) -> str | None:
-    if df is None or df.empty or "close" not in df.columns or len(df) < 60:
-        return None
-    close = df["close"]
-    e9 = calc_ema(close, 9).iloc[-1]
-    e20 = calc_ema(close, 20).iloc[-1]
-    e50 = calc_ema(close, 50).iloc[-1]
-    if any(pd.isna(x) for x in [e9, e20, e50]):
-        return None
-    if e9 > e20 > e50:
-        return "Bullish"
-    if e9 < e20 < e50:
-        return "Bearish"
-    return "Neutral"
-
-
-# =========================
-# 10Y Yield (FRED)
-# =========================
-@st.cache_data(ttl=3600)
-def fred_10y_latest(fred_key: str) -> EndpointResult:
-    if not fred_key:
-        return EndpointResult(False, "missing_key", None, "FRED_API_KEY missing")
-    # DGS10 is daily; latest observation used as a *macro tilt*, not tick-by-tick
-    url = (
-        f"{FRED_BASE}/series/observations"
-        f"?series_id=DGS10&api_key={fred_key}&file_type=json&sort_order=desc&limit=2"
-    )
-    res = http_get_json(url)
-    if not res.ok:
-        return res
-    obs = res.data.get("observations", []) if isinstance(res.data, dict) else []
-    if not obs:
-        return EndpointResult(True, "empty", None, "No FRED observations")
-    latest = safe_float(obs[0].get("value"))
-    prev = safe_float(obs[1].get("value")) if len(obs) > 1 else None
-    return EndpointResult(True, "ok", {"latest": latest, "prev": prev}, "")
-
-
-# =========================
-# Scoring (CALLS / PUTS only)
-# =========================
-def build_signal_and_confidence(
-    rsi, macd_hist, vwap_above, ema_bias, vol_ratio,
-    uw_bias, put_call_vol, iv_spike, ten_y_delta
-):
-    """
-    0–100 confidence.
-    Outputs:
-      direction: Bullish/Bearish/Neutral
-      signal: BUY CALLS / BUY PUTS / WAIT
-    """
-    score = 50.0
-
-    # RSI
-    if rsi is not None:
-        if rsi < 35:
-            score += 6
-        elif rsi > 70:
-            score -= 6
-
-    # MACD hist
-    if macd_hist is not None:
-        score += 8 if macd_hist > 0 else -8
-
-    # VWAP
-    if vwap_above is not None:
-        score += 8 if vwap_above else -8
-
-    # EMA stack
-    if ema_bias == "Bullish":
-        score += 10
-    elif ema_bias == "Bearish":
-        score -= 10
-
-    # Volume ratio (momentum confirmation)
-    if vol_ratio is not None:
-        if vol_ratio >= 1.8:
-            score += 6
-        elif vol_ratio <= 0.7:
-            score -= 3
-
-    # UW bias (flow)
-    if uw_bias == "Bullish":
-        score += 12
-    elif uw_bias == "Bearish":
-        score -= 12
-
-    # Put/Call volume tilt from options chain
-    if put_call_vol is not None:
-        if put_call_vol >= 1.3:
-            score -= 6
-        elif put_call_vol <= 0.77:
-            score += 6
-
-    # IV spike: higher IV usually helps puts more (crash/fear), but can also mean “premium expensive”.
-    # We use it as *risk tilt*; if spike, reduce confidence slightly.
-    if iv_spike is True:
-        score -= 3
-
-    # 10Y delta (macro tilt): rising yields often pressure growth/tech intraday; falling yields supportive.
-    if ten_y_delta is not None:
-        if ten_y_delta >= 0.05:
-            score -= 4
-        elif ten_y_delta <= -0.05:
-            score += 4
-
-    score = clamp(score, 0, 100)
-
-    # direction & signal
-    if score >= 55:
-        direction = "Bullish"
-        signal = "BUY CALLS"
-    elif score <= 45:
-        direction = "Bearish"
-        signal = "BUY PUTS"
-    else:
-        direction = "Neutral"
-        signal = "WAIT"
-
-    return score, direction, signal
-
-
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="Institutional Options Signals", layout="wide")
-
-st.title("🏛️ Institutional Options Signals (5m) — CALLS / PUTS ONLY")
-st.caption(f"Last update (CST): {now_cst().strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-# ---- Secrets
-UW_TOKEN = st.secrets.get("UW_TOKEN", os.getenv("UW_TOKEN", "")).strip()
-EODHD_API_KEY = st.secrets.get("EODHD_API_KEY", os.getenv("EODHD_API_KEY", "")).strip()
-FRED_API_KEY = st.secrets.get("FRED_API_KEY", os.getenv("FRED_API_KEY", "")).strip()
-FINVIZ_AUTH = st.secrets.get("FINVIZ_AUTH", os.getenv("FINVIZ_AUTH", "")).strip()  # optional, not used
-
-# ---- Sidebar settings
-with st.sidebar:
-    st.header("Settings")
-
-    tickers_text = st.text_input(
-        "Type any tickers (comma-separated).",
-        value=DEFAULT_TICKERS,
-        help="Example: SPY,TSLA,NVDA (you can type ANY ticker)"
-    )
-    tickers = parse_tickers(tickers_text)
-    if not tickers:
-        st.warning("Please enter at least one ticker (e.g., SPY).")
-        st.stop()
-
-    selected = st.multiselect("Track tickers", options=tickers, default=tickers[:3])
-
-    st.divider()
-    news_lookback = st.number_input("News lookback (minutes)", min_value=10, max_value=360, value=DEFAULT_NEWS_LOOKBACK_MIN, step=10)
-    price_lookback = st.number_input("Price lookback (minutes)", min_value=60, max_value=2000, value=DEFAULT_PRICE_LOOKBACK_MIN, step=30)
-    interval = st.selectbox("Intraday interval", ["5m", "1m", "15m"], index=0)
-
-    st.divider()
-    refresh_sec = st.slider("Auto-refresh (seconds)", min_value=10, max_value=120, value=DEFAULT_REFRESH_SEC, step=5)
-    institutional_threshold = st.slider("Institutional mode: signals only if confidence ≥", 50, 95, 75, 1)
-
-    st.divider()
-    st.subheader("Weights (sum doesn’t have to be 1)")
-    w_rsi = st.slider("RSI weight", 0.0, 0.30, 0.15, 0.01)
-    w_macd = st.slider("MACD weight", 0.0, 0.30, 0.15, 0.01)
-    w_vwap = st.slider("VWAP weight", 0.0, 0.30, 0.15, 0.01)
-    w_ema = st.slider("EMA stack (9/20/50) weight", 0.0, 0.40, 0.18, 0.01)
-    w_vol = st.slider("Volume ratio weight", 0.0, 0.30, 0.12, 0.01)
-    w_uw = st.slider("UW flow weight", 0.0, 0.40, 0.20, 0.01)
-    w_news = st.slider("News weight (placeholder)", 0.0, 0.20, 0.05, 0.01)
-    w_10y = st.slider("10Y yield (optional) weight", 0.0, 0.20, 0.05, 0.01)
-
-    st.divider()
-    st.subheader("Keys status (green/red)")
-    def key_box(name, ok):
-        st.success(name) if ok else st.error(name)
-
-    key_box("UW_TOKEN", bool(UW_TOKEN))
-    key_box("EODHD_API_KEY", bool(EODHD_API_KEY))
-    key_box("FRED_API_KEY (10Y live)", bool(FRED_API_KEY))
-    st.info("FINVIZ_AUTH not required (optional).")
-
-
-# ---- Auto refresh (safe)
-# Streamlit Cloud sometimes doesn’t have streamlit_autorefresh. We do a simple timer rerun.
-if "last_rerun" not in st.session_state:
-    st.session_state.last_rerun = time.time()
-
-if time.time() - st.session_state.last_rerun >= refresh_sec:
-    st.session_state.last_rerun = time.time()
-    st.rerun()
-
-
-# =========================
-# Layout columns
-# =========================
-left, right = st.columns([1.45, 1.0], gap="large")
-
-# ---- LEFT: UW Screener embed
-with left:
-    st.subheader("Unusual Whales Screener (web view)")
-    st.caption("Embedded. Best filtering (DTE/ITM/premium) is still done in the UW screener UI.")
-    # Embed UW screener
-    components.iframe("https://unusualwhales.com/flow", height=720, scrolling=True)
-
-# ---- RIGHT: status + signals + alerts + news
-with right:
-    st.subheader("Endpoints status")
-
-    # FRED 10Y
-    ten = fred_10y_latest(FRED_API_KEY)
-    ten_latest = ten.data.get("latest") if ten.ok and isinstance(ten.data, dict) else None
-    ten_prev = ten.data.get("prev") if ten.ok and isinstance(ten.data, dict) else None
-    ten_delta = (ten_latest - ten_prev) if (ten_latest is not None and ten_prev is not None) else None
-
-    # UW flow alerts
-    uw = uw_flow_alerts(limit=120, uw_token=UW_TOKEN)
-
-    # Endpoint cards
-    def endpoint_card(label, res: EndpointResult):
-        if res.ok and res.status == "ok":
-            st.success(f"{label} (ok)")
-        elif res.ok and res.status == "empty":
-            st.warning(f"{label} (empty) — {res.error or 'No data returned'}")
-        else:
-            st.error(f"{label} ({res.status}) — {res.error[:140]}")
-
-    # We show statuses *overall* (not per ticker)
-    # EODHD bars status depends on first selected ticker only (for quick health check)
-    bars_health = eodhd_intraday_bars(selected[0], price_lookback, interval, EODHD_API_KEY)
-    endpoint_card("EODHD intraday bars", bars_health)
-
-    endpoint_card("UW flow-alerts", uw)
-
-    news_health = eodhd_news(selected[0], news_lookback, EODHD_API_KEY)
-    endpoint_card("EODHD news", news_health)
-
-    if ten.ok and ten.status == "ok":
-        st.success("FRED 10Y yield (ok)")
-    else:
-        st.warning(f"FRED 10Y yield ({ten.status}) — {ten.error[:120]}")
-
-    st.divider()
-
-    # =========================
-    # Signals table
-    # =========================
-    st.subheader("Live Score / Signals (EODHD intraday + EODHD headlines + UW flow)")
-
-    # Prepare UW alerts dataframe
-    uw_df = uw.data if (uw.ok and isinstance(uw.data, pd.DataFrame)) else pd.DataFrame()
-
-    # Build filtered UW alerts by ticker (best-effort; depends on UW fields available)
-    def filter_uw_by_ticker(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        t = ticker.upper()
-
-        out = df.copy()
-
-        # Try common field names
-        underlying_cols = [c for c in out.columns if c.lower() in ("ticker", "underlying", "underlying_symbol", "symbol")]
-        if underlying_cols:
-            out = out[out[underlying_cols[0]].astype(str).str.upper().eq(t)]
-
-        # Premium filter
-        prem_cols = [c for c in out.columns if "premium" in c.lower()]
-        if prem_cols:
-            prem = pd.to_numeric(out[prem_cols[0]], errors="coerce")
-            out = out[prem >= MIN_PREMIUM_USD]
-
+    def __init__(self, path: str = IV_STORE_FILE):
+        self.path = path
+        ensure_json_file(self.path, default_value={})
+
+    def load_all(self) -> Dict[str, List[Dict[str, Any]]]:
+        data = read_json_file(self.path, {})
+        return data if isinstance(data, dict) else {}
+
+    def save_all(self, data: Dict[str, List[Dict[str, Any]]]) -> None:
+        write_json_file(self.path, data)
+
+    def upsert_today(self, key: str, iv_value: float) -> None:
+        if iv_value <= 0:
+            return
+        data = self.load_all()
+        rows = data.get(key, [])
+        if not isinstance(rows, list):
+            rows = []
+
+        t = today_yyyy_mm_dd()
+        replaced = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("date") == t:
+                r["iv"] = float(iv_value)
+                replaced = True
+                break
+        if not replaced:
+            rows.append({"date": t, "iv": float(iv_value)})
+
+        rows = [r for r in rows if isinstance(r, dict) and r.get("date") and safe_float(r.get("iv", 0)) > 0]
+        rows.sort(key=lambda r: str(r.get("date")))
+        rows = rows[-120:]  # keep last ~4 months
+
+        data[key] = rows
+        self.save_all(data)
+
+    def get_history_map(self, key: str) -> Dict[str, float]:
+        data = self.load_all()
+        rows = data.get(key, [])
+        out: Dict[str, float] = {}
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                d = str(r.get("date", ""))
+                iv = safe_float(r.get("iv", 0))
+                if d and iv > 0:
+                    out[d] = iv
         return out
 
-    rows = []
-    for tkr in selected:
-        bars_res = eodhd_intraday_bars(tkr, price_lookback, interval, EODHD_API_KEY)
-        bars_df = bars_res.data if (bars_res.ok and isinstance(bars_res.data, pd.DataFrame)) else pd.DataFrame()
+    def detect_ramp(
+        self, key: str, lookback_days: int = 3, require_strict: bool = True
+    ) -> Tuple[bool, List[Tuple[str, float]]]:
+        hist = self.get_history_map(key)
+        if len(hist) < lookback_days:
+            return False, []
+        dates_sorted = sorted(hist.keys())
+        last_dates = dates_sorted[-lookback_days:]
+        pts = [(d, float(hist[d])) for d in last_dates]
+        vals = [v for _, v in pts]
+        if require_strict:
+            ok = all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
+        else:
+            ok = all(vals[i] <= vals[i + 1] for i in range(len(vals) - 1))
+        return ok, pts
 
-        rsi = calc_rsi(bars_df["close"]) if not bars_df.empty and "close" in bars_df.columns else None
-        macd_hist = calc_macd_hist(bars_df["close"]) if not bars_df.empty and "close" in bars_df.columns else None
-        vwap = calc_vwap(bars_df) if not bars_df.empty else None
-        last_close = float(bars_df["close"].iloc[-1]) if (not bars_df.empty and "close" in bars_df.columns) else None
-        vwap_above = (last_close > vwap) if (last_close is not None and vwap is not None) else None
-        ema_bias = ema_stack_bias(bars_df) if not bars_df.empty else None
-        vol_ratio = calc_vol_ratio(bars_df) if not bars_df.empty else None
+    def raw_text(self) -> str:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
 
-        # Options chain: Put/Call volume ratio + IV_now
-        chain_res = eodhd_options_chain(tkr, EODHD_API_KEY)
-        chain_df = chain_res.data if (chain_res.ok and isinstance(chain_res.data, pd.DataFrame)) else pd.DataFrame()
+    def reset(self) -> None:
+        self.save_all({})
 
-        put_call_vol = None
-        iv_now = None
-        if not chain_df.empty:
-            # Put/Call vol
-            if "type" in chain_df.columns and "volume" in chain_df.columns:
-                puts = chain_df[chain_df["type"].astype(str).str.lower().str.contains("put", na=False)]["volume"].sum()
-                calls = chain_df[chain_df["type"].astype(str).str.lower().str.contains("call", na=False)]["volume"].sum()
-                if calls and calls > 0:
-                    put_call_vol = float(puts / calls)
 
-            # IV_now: median impliedVolatility
-            if "impliedVolatility" in chain_df.columns:
-                iv_med = chain_df["impliedVolatility"].median()
-                iv_now = normalize_iv(iv_med)
+# -------------------- API Clients --------------------
 
-        # UW bias from flow alerts (best-effort)
-        uw_t = filter_uw_by_ticker(uw_df, tkr)
-        uw_bias = None
-        uw_unusual = "NO"
-        if not uw_t.empty:
-            uw_unusual = "YES"
-            # Try to infer call/put dominance
-            type_cols = [c for c in uw_t.columns if "type" in c.lower() or "side" in c.lower()]
-            prem_cols = [c for c in uw_t.columns if "premium" in c.lower()]
-            if type_cols and prem_cols:
-                typ = uw_t[type_cols[0]].astype(str).str.lower()
-                prem = pd.to_numeric(uw_t[prem_cols[0]], errors="coerce").fillna(0)
-                call_p = prem[typ.str.contains("call", na=False)].sum()
-                put_p = prem[typ.str.contains("put", na=False)].sum()
-                if call_p > put_p * 1.1:
-                    uw_bias = "Bullish"
-                elif put_p > call_p * 1.1:
-                    uw_bias = "Bearish"
-                else:
-                    uw_bias = "Neutral"
 
-        # IV spike (we only flag if IV_now is present and very high vs a rough threshold)
-        iv_spike = None
-        if iv_now is not None:
-            iv_spike = True if iv_now >= 65 else False
+class UnusualWhalesAPI:
+    BASE_URL = "https://api.unusualwhales.com/api"
 
-        # Weighted score: we’ll map weights into our scoring by scaling inputs
-        # (Still outputs 0–100 and CALLS/PUTS/WAIT)
-        score, direction, signal = build_signal_and_confidence(
-            rsi=rsi,
-            macd_hist=macd_hist,
-            vwap_above=vwap_above,
-            ema_bias=ema_bias,
-            vol_ratio=vol_ratio,
-            uw_bias=uw_bias,
-            put_call_vol=put_call_vol,
-            iv_spike=iv_spike,
-            ten_y_delta=ten_delta,
+    def __init__(self, token: str):
+        self.token = token.strip()
+        self.headers = {
+            "Accept": "application/json, text/plain",
+            "Authorization": f"Bearer {self.token}" if self.token else "",
+        }
+
+    def test_connection(self) -> Tuple[bool, str]:
+        if not self.token:
+            return False, "Missing UW_TOKEN"
+        status, data, err = http_get(
+            f"{self.BASE_URL}/option-trades/flow-alerts",
+            headers=self.headers,
+            params={"limit": 1},
+        )
+        if status == 200 and data:
+            return True, "UW flow-alerts (ok)"
+        return False, err or "UW failed"
+
+    def get_flows(self, limit: int = 100) -> List[Dict[str, Any]]:
+        if not self.token:
+            return []
+        status, data, _ = http_get(
+            f"{self.BASE_URL}/option-trades/flow-alerts",
+            headers=self.headers,
+            params={"limit": limit},
+        )
+        if status != 200 or not data:
+            return []
+        return data.get("data", []) or []
+
+    def get_ticker_flow(self, ticker: str, limit: int = 180) -> List[Dict[str, Any]]:
+        if not self.token:
+            return []
+        ticker = ticker.strip().upper()
+        status, data, _ = http_get(
+            f"{self.BASE_URL}/stock/{ticker}/options-flow",
+            headers=self.headers,
+            params={"limit": limit},
+        )
+        if status == 200 and data:
+            return data.get("data", []) or []
+        return []
+
+    def get_earnings(self, ticker: str) -> List[Dict[str, Any]]:
+        if not self.token:
+            return []
+        ticker = ticker.strip().upper()
+        status, data, _ = http_get(
+            f"{self.BASE_URL}/stock/{ticker}/earnings-history",
+            headers=self.headers,
+        )
+        if status == 200 and data:
+            return data.get("data", []) or []
+        return []
+
+
+class PolygonAPI:
+    BASE_URL = "https://api.polygon.io"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+
+    def test_connection(self) -> Tuple[bool, str]:
+        if not self.api_key:
+            return False, "Missing POLYGON_API_KEY"
+        status, data, err = http_get(
+            f"{self.BASE_URL}/v2/aggs/ticker/AAPL/prev",
+            params={"apiKey": self.api_key},
+        )
+        if status == 200 and data and data.get("status") == "OK":
+            return True, "Polygon (ok)"
+        return False, err or "Polygon failed"
+
+    def get_previous_close(self, ticker: str) -> Tuple[float, str]:
+        if not self.api_key:
+            return 0.0, "Missing POLYGON_API_KEY"
+        ticker = ticker.strip().upper()
+        status, data, err = http_get(
+            f"{self.BASE_URL}/v2/aggs/ticker/{ticker}/prev",
+            params={"apiKey": self.api_key},
+        )
+        if status == 200 and data:
+            results = data.get("results") or []
+            if results:
+                return safe_float(results[0].get("c", 0.0)), "Polygon prev close"
+        return 0.0, f"Polygon prev close error: {err or 'no data'}"
+
+    def get_spot_at_time(self, ticker: str, timestamp_ct: str) -> Tuple[float, str]:
+        """
+        Get spot near the flow timestamp using Polygon 1-min aggregates for that day.
+        Falls back to previous close if bars unavailable.
+        """
+        ticker = ticker.strip().upper()
+        if not self.api_key:
+            return 0.0, "Missing POLYGON_API_KEY"
+        try:
+            if not timestamp_ct or "CT" not in timestamp_ct:
+                return self.get_previous_close(ticker)
+
+            parts = timestamp_ct.replace(" CT", "").strip()
+            dt_ct = datetime.strptime(parts, "%Y-%m-%d %I:%M:%S %p")
+            trade_date = dt_ct.strftime("%Y-%m-%d")
+
+            url = f"{self.BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{trade_date}/{trade_date}"
+            status, data, err = http_get(url, params={"apiKey": self.api_key, "limit": 50000})
+            if status == 200 and data and data.get("results"):
+                bars = data["results"]
+                target_min = dt_ct.hour * 60 + dt_ct.minute
+
+                closest = None
+                best = 10_000
+                for bar in bars:
+                    bar_ts = safe_float(bar.get("t", 0)) / 1000.0
+                    bar_dt_utc = datetime.utcfromtimestamp(bar_ts).replace(tzinfo=timezone.utc)
+                    bar_ct = bar_dt_utc + timedelta(hours=CT_OFFSET)
+                    bar_min = bar_ct.hour * 60 + bar_ct.minute
+                    diff = abs(bar_min - target_min)
+                    if diff < best:
+                        best = diff
+                        closest = bar
+
+                if closest:
+                    # even if diff is a bit large (early open / thin), still use closest bar
+                    return safe_float(closest.get("c", 0.0)), f"Polygon intraday (Δ{best}m)"
+            # fallback
+            px, src = self.get_previous_close(ticker)
+            return px, f"{src} (intraday missing)"
+        except Exception as e:
+            px, src = self.get_previous_close(ticker)
+            return px, f"{src} (spot error: {e})"
+
+    def get_price_history(self, ticker: str, days: int = 30) -> List[Dict[str, Any]]:
+        if not self.api_key:
+            return []
+        ticker = ticker.strip().upper()
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            url = (
+                f"{self.BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
+                f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+            )
+            status, data, _ = http_get(url, params={"apiKey": self.api_key, "limit": days})
+            if status == 200 and data:
+                out: List[Dict[str, Any]] = []
+                for r in (data.get("results") or []):
+                    out.append(
+                        {
+                            "date": datetime.fromtimestamp(safe_float(r.get("t", 0)) / 1000.0).strftime("%Y-%m-%d"),
+                            "open": safe_float(r.get("o", 0)),
+                            "high": safe_float(r.get("h", 0)),
+                            "low": safe_float(r.get("l", 0)),
+                            "close": safe_float(r.get("c", 0)),
+                            "volume": safe_float(r.get("v", 0)),
+                        }
+                    )
+                return out
+            return []
+        except Exception:
+            return []
+
+    def calculate_support_resistance(self, ticker: str, strike: float) -> Dict[str, Any]:
+        candles = self.get_price_history(ticker, 30)
+        if not candles or len(candles) < 5:
+            return {}
+        highs = [safe_float(c["high"]) for c in candles]
+        lows = [safe_float(c["low"]) for c in candles]
+
+        resistance = max(highs[-10:]) if len(highs) >= 10 else max(highs)
+        support = min(lows[-10:]) if len(lows) >= 10 else min(lows)
+
+        recent_high_wick = max(highs[-5:]) if len(highs) >= 5 else max(highs)
+        recent_low_wick = min(lows[-5:]) if len(lows) >= 5 else min(lows)
+
+        wick_triggered = (abs(strike - recent_high_wick) < 0.5) or (abs(strike - recent_low_wick) < 0.5)
+        return {
+            "resistance": resistance,
+            "support": support,
+            "recent_high_wick": recent_high_wick,
+            "recent_low_wick": recent_low_wick,
+            "wick_triggered": wick_triggered,
+        }
+
+
+class EODHDAPI:
+    BASE_URL = "https://eodhd.com/api"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+
+    def test_connection(self) -> Tuple[bool, str]:
+        if not self.api_key:
+            return False, "Missing EODHD_API_KEY"
+        status, data, err = http_get(
+            f"{self.BASE_URL}/eod/AAPL.US",
+            params={"api_token": self.api_key, "fmt": "json", "from": "2025-01-01", "limit": 1},
+        )
+        if status == 200 and data:
+            return True, "EODHD (ok)"
+        return False, err or "EODHD failed"
+
+    def get_iv_from_chain(self, ticker: str, strike: float, expiry: str, option_type: str) -> float:
+        """Return current IV% for a contract if found; else 0."""
+        if not self.api_key:
+            return 0.0
+        ticker = ticker.strip().upper()
+        option_type = option_type.lower().strip()
+        try:
+            url = f"{self.BASE_URL}/options/{ticker}.US"
+            status, data, err = http_get(url, params={"api_token": self.api_key, "fmt": "json"})
+            if status != 200 or not data or not isinstance(data, dict):
+                return 0.0
+
+            for exp_key, chain in data.items():
+                if expiry not in str(exp_key):
+                    continue
+                if not isinstance(chain, dict):
+                    continue
+
+                options_list = chain.get(option_type + "s", [])
+                if isinstance(options_list, dict):
+                    options_list = list(options_list.values())
+                if not isinstance(options_list, list):
+                    continue
+
+                for opt in options_list:
+                    if not isinstance(opt, dict):
+                        continue
+                    opt_strike = safe_float(opt.get("strike", 0))
+                    if abs(opt_strike - strike) < 0.5:
+                        iv = safe_float(opt.get("impliedVolatility", 0))
+                        if iv > 0:
+                            if iv < 1:
+                                iv *= 100
+                            return float(iv)
+            return 0.0
+        except Exception:
+            return 0.0
+
+
+# -------------------- Enrichment + Ladder --------------------
+
+
+class LadderDetector:
+    """
+    Ladder detection:
+    - Requires same expiry + type
+    - Requires >= min_unique_strikes total strikes within recent_minutes (including target)
+    """
+
+    def __init__(self, uw: UnusualWhalesAPI):
+        self.uw = uw
+
+    def detect(
+        self,
+        ticker: str,
+        target_strike: float,
+        option_type: str,
+        expiry: str,
+        recent_minutes: int = 90,
+        min_unique_strikes: int = 3,
+    ) -> Tuple[bool, List[float]]:
+        flows = self.uw.get_ticker_flow(ticker, limit=180)
+        if not flows:
+            return False, []
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=recent_minutes)
+
+        strikes: set[float] = {float(target_strike)}
+        for f in flows:
+            f_type = str(f.get("option_type", "")).lower().strip()
+            f_expiry = str(f.get("expiry", "")).strip()
+            if f_type != option_type or f_expiry != expiry:
+                continue
+            ts = parse_uw_time_to_utc(str(f.get("start_time", "")))
+            if ts is None or ts < cutoff:
+                continue
+            s = safe_float(f.get("strike", 0))
+            if s > 0:
+                strikes.add(float(s))
+
+        if len(strikes) >= min_unique_strikes:
+            related = sorted([s for s in strikes if abs(s - target_strike) > 1e-9])
+            return True, related
+        return False, []
+
+
+class DataEnricher:
+    def __init__(
+        self,
+        uw: UnusualWhalesAPI,
+        polygon: PolygonAPI,
+        eodhd: EODHDAPI,
+        iv_store: LocalIVStore,
+        iv_lookback_days: int = 3,
+        iv_require_strict: bool = True,
+    ):
+        self.uw = uw
+        self.polygon = polygon
+        self.eodhd = eodhd
+        self.iv_store = iv_store
+        self.iv_lookback_days = iv_lookback_days
+        self.iv_require_strict = iv_require_strict
+
+    def enrich_trade(self, raw_flow: Dict[str, Any], use_iv: bool = True) -> Dict[str, Any]:
+        ticker = str(raw_flow.get("ticker", "")).upper().strip()
+        strike = safe_float(raw_flow.get("strike", 0))
+        option_type = str(raw_flow.get("option_type", "call")).lower().strip()
+        expiry = str(raw_flow.get("expiry", "")).strip()
+        timestamp = str(raw_flow.get("start_time", "")).strip()
+
+        timestamp_ct = to_central_time(timestamp)
+
+        # Polygon spot at time
+        spot, spot_source = self.polygon.get_spot_at_time(ticker, timestamp_ct)
+
+        # Strike distance
+        if spot > 0:
+            strike_dist_pct = abs(strike - spot) / spot * 100.0
+            is_otm = (strike > spot) if option_type == "call" else (strike < spot)
+        else:
+            strike_dist_pct = 0.0
+            is_otm = True
+
+        # Premium and ask%
+        total_prem = (
+            safe_float(raw_flow.get("total_ask_side_prem", 0))
+            + safe_float(raw_flow.get("total_bid_side_prem", 0))
+            + safe_float(raw_flow.get("total_mid_side_prem", 0))
+            + safe_float(raw_flow.get("total_no_side_prem", 0))
+        )
+        ask_prem = safe_float(raw_flow.get("total_ask_side_prem", 0))
+        ask_pct = (ask_prem / total_prem * 100.0) if total_prem > 0 else 0.0
+
+        volume = safe_int(raw_flow.get("total_size", 0))
+        oi = safe_int(raw_flow.get("open_interest", 0))
+        vol_oi_ratio = (volume / oi) if oi > 0 else 999.0
+
+        denom = (spot * 100.0 * max(volume, 1)) if spot > 0 else 0.0
+        premium_pct = (total_prem / denom * 100.0) if denom > 0 else 0.0
+
+        dte = calculate_dte(expiry)
+
+        # Polygon S/R wick
+        sr = self.polygon.calculate_support_resistance(ticker, strike)
+
+        # Earnings (UW)
+        days_to_er: Optional[int] = None
+        earnings = self.uw.get_earnings(ticker)
+        if earnings:
+            today_dt = datetime.now()
+            for er in earnings:
+                er_date_str = str(er.get("date", "")).strip()
+                try:
+                    er_date = datetime.strptime(er_date_str, "%Y-%m-%d")
+                    delta = (er_date - today_dt).days
+                    if 0 <= delta <= 30:
+                        days_to_er = delta
+                        break
+                except Exception:
+                    continue
+
+        # EODHD chain IV + local store ramp
+        ckey = contract_key(ticker, expiry, option_type, strike)
+        current_iv = 0.0
+        if use_iv:
+            current_iv = self.eodhd.get_iv_from_chain(ticker, strike, expiry, option_type)
+            if current_iv > 0:
+                self.iv_store.upsert_today(ckey, current_iv)
+
+        local_iv = self.iv_store.get_history_map(ckey)
+        iv_ramping, ramp_pts = self.iv_store.detect_ramp(
+            ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
         )
 
-        institutional = "YES" if score >= institutional_threshold else "NO"
+        clean_exception = (
+            ask_pct >= 70 and vol_oi_ratio > 1 and strike_dist_pct <= 7 and 2.5 <= premium_pct <= 5.0
+        )
 
-        rows.append({
-            "Ticker": tkr,
-            "Confidence": round(score, 1),
-            "Direction": direction,
-            "Signal": signal,
-            "Institutional": institutional,
-            "RSI": None if rsi is None else round(rsi, 2),
-            "MACD_hist": None if macd_hist is None else round(macd_hist, 4),
-            "VWAP_above": None if vwap_above is None else ("Above" if vwap_above else "Below"),
-            "EMA_stack": ema_bias,
-            "Vol_ratio": None if vol_ratio is None else round(vol_ratio, 2),
-            "UW_unusual": uw_unusual,
-            "UW_bias": uw_bias if uw_bias else "N/A",
-            "Put/Call_vol": None if put_call_vol is None else round(put_call_vol, 2),
-            "IV_now(%)": None if iv_now is None else round(iv_now, 2),
-            "IV_spike": None if iv_spike is None else ("YES" if iv_spike else "NO"),
-            "10Y": None if ten_latest is None else round(ten_latest, 2),
-            "Bars": int(len(bars_df)) if isinstance(bars_df, pd.DataFrame) else 0,
-            "Last_bar(CST)": None if bars_df is None or bars_df.empty else str(bars_df["datetime"].iloc[-1]),
-            "Bars_status": bars_res.status if isinstance(bars_res, EndpointResult) else "N/A",
-            "News_status": "ok" if news_health.ok else news_health.status,
-            "UW_flow_status": "ok" if uw.ok else uw.status,
-        })
+        return {
+            "ticker": ticker,
+            "strike": strike,
+            "option_type": option_type,
+            "expiry": expiry,
+            "entry_timestamp": timestamp_ct,
+            "spot": spot,
+            "spot_source": spot_source,
+            "strike_dist_pct": strike_dist_pct,
+            "is_otm": is_otm,
+            "total_premium": total_prem,
+            "premium_pct": premium_pct,
+            "volume": volume,
+            "open_interest": oi,
+            "vol_oi_ratio": vol_oi_ratio,
+            "ask_pct": ask_pct,
+            "dte": dte,
+            "wick_triggered": bool(sr.get("wick_triggered", False)),
+            "support": safe_float(sr.get("support", 0)),
+            "resistance": safe_float(sr.get("resistance", 0)),
+            "contract_key": ckey,
+            "current_iv": float(current_iv),
+            "iv_history_local": local_iv,
+            "iv_ramping": bool(iv_ramping),
+            "iv_ramp_points": ramp_pts,
+            "iv_ramp_lookback_days": int(self.iv_lookback_days),
+            "days_to_earnings": days_to_er,
+            "clean_exception": bool(clean_exception),
+            "has_sweep": bool(raw_flow.get("is_sweep", False)),
+            "ladder_role": "isolated",
+            "related_strikes": [],
+            "category_tags": [],
+            "_raw": raw_flow,
+        }
 
-    signals_df = pd.DataFrame(rows)
-    st.dataframe(signals_df, use_container_width=True, height=220)
 
-    st.subheader("Institutional Alerts (≥ threshold only)")
-    inst = signals_df[signals_df["Confidence"] >= institutional_threshold].copy()
-    if inst.empty:
-        st.info("No institutional signals right now.")
-    else:
-        st.success("Signals meeting institutional threshold:")
-        st.dataframe(inst[["Ticker", "Confidence", "Direction", "Signal", "UW_unusual", "UW_bias", "IV_now(%)", "10Y"]], use_container_width=True)
+# -------------------- Scoring --------------------
 
-    st.subheader("Unusual Flow Alerts (UW API) — filtered")
-    if not uw_df.empty:
-        # Show latest filtered alerts for selected tickers (best effort)
-        show_rows = []
-        for tkr in selected:
-            sub = filter_uw_by_ticker(uw_df, tkr)
-            if not sub.empty:
-                show_rows.append(sub.head(40))
-        if show_rows:
-            out = pd.concat(show_rows, ignore_index=True)
-            st.dataframe(out.head(60), use_container_width=True, height=220)
+
+class V31ScoringEngine:
+    def score(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        score = 0
+        factors: List[str] = []
+        penalties: List[str] = []
+        record["category_tags"] = record.get("category_tags") or []
+
+        prem_pct = safe_float(record.get("premium_pct", 0))
+        if 2.5 <= prem_pct <= 5.0:
+            score += 2
+            factors.append(f"Premium {prem_pct:.1f}% (+2)")
+        elif 1.0 <= prem_pct < 2.5:
+            score += 1
+            factors.append(f"Premium {prem_pct:.1f}% (+1)")
+        elif prem_pct < 1.0:
+            score -= 2
+            penalties.append(f"Ultra-low premium {prem_pct:.2f}% (-2)")
         else:
-            st.info("No UW alerts matching current filters/tickers (or fields not available).")
-    else:
-        st.info("UW flow alerts empty or unavailable.")
+            factors.append(f"Excessive premium {prem_pct:.1f}% (0)")
 
-    st.subheader(f"News — last {int(news_lookback)} minutes (EODHD)")
-    news_res = eodhd_news(selected[0], news_lookback, EODHD_API_KEY)
-    if news_res.ok and isinstance(news_res.data, pd.DataFrame) and not news_res.data.empty:
-        news_df = news_res.data.copy()
-
-        # Safe display columns (avoid KeyError)
-        cols = []
-        for c in ["published_cst", "source", "title", "url"]:
-            if c in news_df.columns:
-                cols.append(c)
-
-        if not cols:
-            st.info("News returned, but fields are not in expected format for display.")
-            st.write(news_df.head(10))
+        dist = safe_float(record.get("strike_dist_pct", 0))
+        if dist <= 7:
+            score += 2
+            factors.append(f"Strike {dist:.1f}% OTM (+2)")
+        elif dist <= 15:
+            factors.append(f"Strike {dist:.1f}% OTM (0)")
         else:
-            news_show = news_df[cols].head(40)
-            st.dataframe(news_show, use_container_width=True, height=220)
-            st.caption("Tip: Click URL column links (or copy/paste).")
-    elif news_res.ok and news_res.status == "ok":
-        st.info("No news in this lookback window (or EODHD returned none).")
+            score -= 2
+            penalties.append(f"Strike {dist:.1f}% deep OTM (-2)")
+
+        dte = safe_int(record.get("dte", 0))
+        if 7 <= dte <= 21:
+            score += 1
+            factors.append(f"DTE {dte}d (+1)")
+        elif dte <= 1:
+            score -= 1
+            penalties.append("0-1 DTE (-1)")
+
+        ask_pct = safe_float(record.get("ask_pct", 0))
+        if ask_pct >= 70:
+            score += 1
+            factors.append(f"Ask {ask_pct:.0f}% (+1)")
+        elif 0 < ask_pct < 30:
+            score -= 2
+            penalties.append(f"Bid/mid heavy (Ask {ask_pct:.0f}%) (-2)")
+        else:
+            factors.append("Execution side unknown/neutral (0)")
+
+        vol_oi = safe_float(record.get("vol_oi_ratio", 0))
+        if vol_oi >= 2:
+            score += 2
+            factors.append(f"Vol/OI {vol_oi:.1f}x (+2)")
+        elif vol_oi >= 1:
+            score += 1
+            factors.append(f"Vol/OI {vol_oi:.1f}x (+1)")
+
+        if bool(record.get("wick_triggered", False)):
+            score -= 2
+            penalties.append("Wick reversal strike (-2)")
+
+        if bool(record.get("iv_ramping", False)):
+            score += 1
+            factors.append(f"IV ramp (local) (+1) {record.get('iv_ramp_points', [])}")
+
+        ladder_role = str(record.get("ladder_role", "isolated")).lower()
+        if ladder_role in ("anchor", "specleg", "ladder"):
+            score += 1
+            factors.append("Ladder/cluster (+1)")
+        else:
+            score -= 1
+            penalties.append("Isolated (-1)")
+
+        if str(record.get("option_type", "")).lower() == "put":
+            strike = safe_float(record.get("strike", 0))
+            support = safe_float(record.get("support", 0))
+            if strike > support and support > 0:
+                score -= 1
+                penalties.append("Put above support (-1)")
+
+        days_to_er = record.get("days_to_earnings")
+        if isinstance(days_to_er, int) and 2 <= days_to_er <= 10:
+            score += 1
+            factors.append(f"Catalyst {days_to_er}d (+1)")
+
+        # Caps (unlock if local ramp true)
+        if bool(record.get("iv_ramping", False)):
+            max_score = 12
+        elif bool(record.get("clean_exception", False)):
+            max_score = 7
+        else:
+            max_score = 6
+
+        final_score = min(score, max_score)
+
+        if final_score >= 8:
+            verdict = "HIGH CONVICTION"
+            record["category_tags"].append("HighConviction")
+        elif final_score >= 7:
+            verdict = "TRADEABLE"
+            record["category_tags"].append("Tradeable")
+        elif final_score >= 6:
+            verdict = "MODERATE"
+            record["category_tags"].append("Moderate")
+        elif final_score >= 5:
+            verdict = "WATCHLIST"
+            record["category_tags"].append("Watchlist")
+        else:
+            verdict = "TRAP / SKIP"
+            record["category_tags"].append("Trap")
+
+        if bool(record.get("has_sweep", False)):
+            record["category_tags"].append("Sweep")
+        if safe_float(record.get("vol_oi_ratio", 0)) >= 10:
+            record["category_tags"].append("LonelyWhale")
+        if isinstance(days_to_er, int) and days_to_er <= 10:
+            record["category_tags"].append("PreER")
+        if safe_float(record.get("current_iv", 0)) > 0:
+            record["category_tags"].append("HasIV")
+        if safe_float(record.get("spot", 0)) <= 0:
+            record["category_tags"].append("NoSpot")
+
+        record["predictive_score"] = int(final_score)
+        record["max_score"] = int(max_score)
+        record["score_factors"] = factors
+        record["score_penalties"] = penalties
+        record["verdict"] = verdict
+        return record
+
+
+# -------------------- Queues --------------------
+
+
+class QueueManager:
+    def __init__(self, pending_file: str, inverse_file: str, validated_file: str):
+        self.pending_file = pending_file
+        self.inverse_file = inverse_file
+        self.validated_file = validated_file
+        ensure_json_file(self.pending_file, default_value=[])
+        ensure_json_file(self.inverse_file, default_value=[])
+        ensure_json_file(self.validated_file, default_value=[])
+
+    def load_queue(self, filepath: str) -> List[Dict[str, Any]]:
+        if not os.path.exists(filepath):
+            return []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                x = json.load(f)
+                return x if isinstance(x, list) else []
+        except Exception:
+            return []
+
+    def save_queue(self, filepath: str, data: List[Dict[str, Any]]) -> None:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    def add_pending(self, trade: Dict[str, Any]) -> None:
+        q = self.load_queue(self.pending_file)
+        q.append(trade)
+        if len(q) > MAX_PENDING_TRADES:
+            q = q[-MAX_PENDING_TRADES:]
+        self.save_queue(self.pending_file, q)
+
+    def add_inverse(self, trade: Dict[str, Any]) -> None:
+        q = self.load_queue(self.inverse_file)
+        q.append(trade)
+        self.save_queue(self.inverse_file, q)
+
+    def add_validated(self, trade: Dict[str, Any]) -> None:
+        q = self.load_queue(self.validated_file)
+        q.append(trade)
+        self.save_queue(self.validated_file, q)
+
+
+# -------------------- Streamlit UI --------------------
+
+st.set_page_config(page_title="v3.1 Options Flow Scanner", layout="wide")
+st.title("v3.1 Options Flow Scanner (Polygon Spot + EODHD IV + Local IV Ramp)")
+st.caption("Live/Replay • Polygon intraday spot • EODHD chain IV • local IV history • JSON queues")
+
+snapshot = SnapshotManager(SNAPSHOT_FILE)
+iv_store = LocalIVStore(IV_STORE_FILE)
+
+with st.sidebar:
+    st.header("Data Source")
+    replay_mode = st.toggle("Replay Mode (use saved snapshot)", value=False)
+
+    meta = snapshot.get_meta()
+    if meta.get("saved_at_utc"):
+        st.write(f"Snapshot saved: `{meta.get('saved_at_utc')}`")
+        st.write(f"Snapshot count: `{meta.get('count')}`")
     else:
-        st.error(f"News error: {news_res.status} — {news_res.error[:200]}")
+        st.write("Snapshot saved: —")
 
-    with st.expander("What None/N/A/empty means (plain English)"):
-        st.write("""
-- **empty** (intraday bars): the API is working, but returned no bars for your time window (common after-hours).
-- **N/A**: we couldn’t compute the indicator because we didn’t have enough bars or the field wasn’t in the response.
-- **http_4xx / http_5xx**: the server rejected the call (bad key, plan restriction, or endpoint changed).
-""")
+    st.divider()
+    st.header("API Keys (Secrets recommended)")
+    uw_token = st.text_input("UW_TOKEN", value=os.getenv("UW_TOKEN", ""), type="password")
+    polygon_key = st.text_input("POLYGON_API_KEY", value=os.getenv("POLYGON_API_KEY", ""), type="password")
+    eodhd_key = st.text_input("EODHD_API_KEY", value=os.getenv("EODHD_API_KEY", ""), type="password")
 
+    st.divider()
+    st.subheader("Snapshot Tools")
+    uploaded = st.file_uploader("Upload snapshot JSON (optional)", type=["json"])
+    if uploaded is not None:
+        try:
+            up = json.loads(uploaded.read().decode("utf-8"))
+            if isinstance(up, dict) and isinstance(up.get("flows"), list):
+                snapshot.save(up["flows"])
+                st.success("Uploaded snapshot saved.")
+            elif isinstance(up, list):
+                snapshot.save(up)
+                st.success("Uploaded snapshot saved.")
+            else:
+                st.error("Snapshot format not recognized.")
+        except Exception as e:
+            st.error(f"Upload error: {e}")
 
-# =========================
-# Important note: filters you asked for
-# =========================
-st.caption(
-    "Filters requested: premium ≥ $1M, DTE ≤ 3 days, stocks/ETFs only, Volume > OI, exclude ITM. "
-    "UW filtering is best enforced inside UW screener; API filtering is best-effort based on returned fields."
+    if snapshot.exists():
+        st.download_button(
+            "Download current snapshot",
+            data=snapshot.raw_text(),
+            file_name="last_uw_flows.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("Local IV Store")
+    st.caption("IV ramp is built for free by saving one IV value per day.")
+    st.download_button(
+        "Download iv_history_store.json",
+        data=iv_store.raw_text(),
+        file_name="iv_history_store.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    if st.button("Reset IV store (danger)", type="secondary", use_container_width=True):
+        iv_store.reset()
+        st.warning("IV store reset.")
+
+    st.divider()
+    st.subheader("IV Ramp Settings")
+    iv_lookback_days = st.slider("Ramp lookback days", 3, 10, 3, 1)
+    iv_strict = st.checkbox("Require strictly increasing IV", value=True)
+
+    st.divider()
+    st.subheader("Scan Controls")
+    use_iv = st.checkbox("Use EODHD chain IV + store locally", value=True)
+
+    limit = st.slider("UW flow alerts limit (Live only)", 10, 250, 200, 10)
+
+    min_premium = st.number_input("Min premium ($)", min_value=0, value=25_000, step=5_000)
+    min_size = st.number_input("Min size (contracts)", min_value=0, value=0, step=100)
+    min_vol_oi = st.number_input("Min Vol/OI", min_value=0.0, value=1.0, step=0.1)
+
+    require_vol_gt_oi = st.checkbox("Require Vol > OI", value=False)
+    exclude_indices = st.checkbox("Exclude indices + major ETFs (SPX/SPY/QQQ/etc.)", value=True)
+
+    st.divider()
+    st.subheader("Ladder Settings")
+    ladder_minutes = st.slider("Ladder time window (minutes)", 15, 240, 90, 15)
+    ladder_min_strikes = st.slider("Min unique strikes to call a ladder", 2, 6, 3, 1)
+
+    st.divider()
+    st.subheader("Queues")
+    pending_path = st.text_input("Pending file", value=PENDING_TRADES_FILE)
+    inverse_path = st.text_input("Inverse file", value=INVERSE_SIGNALS_FILE)
+    validated_path = st.text_input("Validated file", value=VALIDATED_TRADES_FILE)
+
+# Clients
+uw = UnusualWhalesAPI(uw_token)
+polygon = PolygonAPI(polygon_key)
+eodhd = EODHDAPI(eodhd_key)
+
+enricher = DataEnricher(
+    uw=uw,
+    polygon=polygon,
+    eodhd=eodhd,
+    iv_store=iv_store,
+    iv_lookback_days=int(iv_lookback_days),
+    iv_require_strict=bool(iv_strict),
 )
+scorer = V31ScoringEngine()
+ladder = LadderDetector(uw)
+queue = QueueManager(pending_path, inverse_path, validated_path)
+
+tabs = st.tabs(["Scan", "Queues", "Connections"])
+
+
+def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
+    if replay_mode:
+        return snapshot.load(), "Replay (snapshot)"
+    return uw.get_flows(limit=limit), "Live (UW API)"
+
+
+# -------------------- Scan Tab --------------------
+
+with tabs[0]:
+    st.subheader("Run Scanner")
+
+    colA, colB = st.columns([1, 2], gap="large")
+    with colA:
+        run = st.button("Run scan", type="primary", use_container_width=True)
+
+    with colB:
+        st.markdown(
+            """
+**What this does**
+- Pulls UW flow alerts (Live) or replays a saved snapshot
+- Spot-at-time from **Polygon intraday minute bars** (fallback to prev close)
+- Current IV from **EODHD options chain** + saves daily IV to local store
+- IV ramp detection from your local store (free)
+- Scores v3.1 and writes JSON queues
+"""
+        )
+
+    if run:
+        if not replay_mode and not uw_token:
+            st.error("Live mode requires UW_TOKEN in Secrets.")
+        else:
+            with st.spinner("Loading flows..."):
+                flows, src = get_source_flows()
+
+            if not flows:
+                st.warning(f"No flows from {src}. If using Replay Mode, run Live once to save a snapshot.")
+            else:
+                # save snapshot on live
+                if not replay_mode:
+                    try:
+                        snapshot.save(flows)
+                    except Exception:
+                        pass
+
+                excluded = EXCLUDED_TICKERS_DEFAULT if exclude_indices else set()
+                skip_reasons = {"premium": 0, "excluded": 0, "vol_oi": 0, "min_size": 0, "min_vol_oi": 0, "bad_ticker": 0}
+
+                results: List[Dict[str, Any]] = []
+                skipped = 0
+
+                with st.spinner("Filtering, enriching, laddering, scoring..."):
+                    for f in flows:
+                        ticker = str(f.get("ticker", "")).upper().strip()
+                        if not ticker or len(ticker) > 8:
+                            skipped += 1
+                            skip_reasons["bad_ticker"] += 1
+                            continue
+
+                        total_prem = (
+                            safe_float(f.get("total_ask_side_prem", 0))
+                            + safe_float(f.get("total_bid_side_prem", 0))
+                            + safe_float(f.get("total_mid_side_prem", 0))
+                            + safe_float(f.get("total_no_side_prem", 0))
+                        )
+                        if total_prem < float(min_premium):
+                            skipped += 1
+                            skip_reasons["premium"] += 1
+                            continue
+
+                        if ticker in excluded:
+                            skipped += 1
+                            skip_reasons["excluded"] += 1
+                            continue
+
+                        vol = safe_int(f.get("total_size", 0))
+                        oi = safe_int(f.get("open_interest", 0))
+
+                        if vol < int(min_size):
+                            skipped += 1
+                            skip_reasons["min_size"] += 1
+                            continue
+
+                        if require_vol_gt_oi and (oi > 0) and (vol <= oi):
+                            skipped += 1
+                            skip_reasons["vol_oi"] += 1
+                            continue
+
+                        vol_oi_ratio = (vol / oi) if oi > 0 else 999.0
+                        if vol_oi_ratio < float(min_vol_oi):
+                            skipped += 1
+                            skip_reasons["min_vol_oi"] += 1
+                            continue
+
+                        enriched = enricher.enrich_trade(f, use_iv=bool(use_iv and eodhd_key))
+                        is_l, rel = ladder.detect(
+                            ticker=enriched["ticker"],
+                            target_strike=enriched["strike"],
+                            option_type=enriched["option_type"],
+                            expiry=enriched["expiry"],
+                            recent_minutes=int(ladder_minutes),
+                            min_unique_strikes=int(ladder_min_strikes),
+                        )
+                        if is_l:
+                            enriched["ladder_role"] = "ladder"
+                            enriched["related_strikes"] = rel
+
+                        scored = scorer.score(enriched)
+                        results.append(scored)
+
+                        if safe_int(scored.get("predictive_score", 0)) >= 5:
+                            queue.add_pending(scored)
+                        if safe_int(scored.get("predictive_score", 0)) <= -3:
+                            queue.add_inverse(scored)
+
+                st.success(f"Source: {src} • Scored {len(results)} • Skipped {skipped}")
+                st.write("Skip breakdown:", skip_reasons)
+
+                if results:
+                    results.sort(
+                        key=lambda r: (safe_int(r.get("predictive_score", 0)), safe_float(r.get("total_premium", 0))),
+                        reverse=True,
+                    )
+
+                    table = []
+                    for r in results:
+                        table.append(
+                            {
+                                "Ticker": r.get("ticker"),
+                                "Type": str(r.get("option_type", "")).upper(),
+                                "Strike": r.get("strike"),
+                                "Expiry": r.get("expiry"),
+                                "Spot": round(safe_float(r.get("spot", 0.0)), 2),
+                                "SpotSrc": r.get("spot_source"),
+                                "Dist%": round(safe_float(r.get("strike_dist_pct", 0.0)), 2),
+                                "Premium$": round(safe_float(r.get("total_premium", 0.0))),
+                                "Prem%": round(safe_float(r.get("premium_pct", 0.0)), 2),
+                                "Ask%": round(safe_float(r.get("ask_pct", 0.0)), 1),
+                                "Vol/OI": round(safe_float(r.get("vol_oi_ratio", 0.0)), 2),
+                                "IV%": round(safe_float(r.get("current_iv", 0.0)), 2),
+                                "IVRamp": bool(r.get("iv_ramping", False)),
+                                "Wick": bool(r.get("wick_triggered", False)),
+                                "Ladder": (r.get("ladder_role") != "isolated"),
+                                "Score": r.get("predictive_score"),
+                                "Max": r.get("max_score"),
+                                "Verdict": r.get("verdict"),
+                                "Tags": ", ".join(r.get("category_tags", [])),
+                            }
+                        )
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+
+                    st.divider()
+                    st.subheader("Details")
+                    for r in results[:60]:
+                        header = (
+                            f"{r['ticker']} {str(r['option_type']).upper()} ${r['strike']} {r['expiry']} • "
+                            f"Score {r['predictive_score']}/{r['max_score']} • {r['verdict']}"
+                        )
+                        with st.expander(header, expanded=False):
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.write("**Entry (CT)**", r.get("entry_timestamp"))
+                                st.write("**Spot**", round(safe_float(r.get("spot", 0)), 2))
+                                st.write("**Spot source**", r.get("spot_source"))
+                                st.write("**DTE**", r.get("dte"))
+                                st.write("**Premium**", pretty_money(safe_float(r.get("total_premium", 0))))
+                                st.write("**Ask%**", f"{safe_float(r.get('ask_pct', 0)):.1f}%")
+                                st.write("**Vol/OI**", f"{safe_float(r.get('vol_oi_ratio', 0)):.2f}x")
+                            with c2:
+                                st.write("**IV (current)**", f"{safe_float(r.get('current_iv', 0)):.2f}%")
+                                st.write("**IV ramp**", bool(r.get("iv_ramping", False)))
+                                st.write("**IV ramp points**", r.get("iv_ramp_points"))
+                                st.write("**Local IV history**")
+                                st.json(r.get("iv_history_local", {}))
+
+                            st.write("**Factors**")
+                            st.write("\n".join([f"• {x}" for x in r.get("score_factors", [])]) or "—")
+                            st.write("**Penalties**")
+                            st.write("\n".join([f"• {x}" for x in r.get("score_penalties", [])]) or "—")
+
+                            st.write("**Raw UW (debug)**")
+                            st.json(r.get("_raw", {}))
+
+# -------------------- Queues Tab --------------------
+
+with tabs[1]:
+    st.subheader("Queues")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.write("### Pending")
+        pend = queue.load_queue(pending_path)
+        st.write(f"{len(pend)} items")
+        st.dataframe(
+            [
+                {
+                    "Ticker": t.get("ticker"),
+                    "Type": t.get("option_type"),
+                    "Strike": t.get("strike"),
+                    "Expiry": t.get("expiry"),
+                    "Score": t.get("predictive_score"),
+                    "Verdict": t.get("verdict"),
+                }
+                for t in pend[-200:]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with c2:
+        st.write("### Inverse")
+        inv = queue.load_queue(inverse_path)
+        st.write(f"{len(inv)} items")
+        st.dataframe(
+            [
+                {
+                    "Ticker": t.get("ticker"),
+                    "Type": t.get("option_type"),
+                    "Strike": t.get("strike"),
+                    "Expiry": t.get("expiry"),
+                    "Score": t.get("predictive_score"),
+                    "Verdict": t.get("verdict"),
+                }
+                for t in inv[-200:]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with c3:
+        st.write("### Validated")
+        val = queue.load_queue(validated_path)
+        st.write(f"{len(val)} items")
+        st.dataframe(
+            [
+                {
+                    "Ticker": t.get("ticker"),
+                    "Type": t.get("option_type"),
+                    "Strike": t.get("strike"),
+                    "Expiry": t.get("expiry"),
+                    "Pred": t.get("predictive_score"),
+                    "Val": t.get("validated_score"),
+                    "Val Verdict": t.get("validated_verdict"),
+                }
+                for t in val[-200:]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# -------------------- Connections Tab --------------------
+
+with tabs[2]:
+    st.subheader("Connections / Endpoint Status")
+
+    # Test endpoints
+    uw_ok, uw_msg = uw.test_connection()
+    poly_ok, poly_msg = polygon.test_connection()
+    eod_ok, eod_msg = eodhd.test_connection()
+
+    # Show like a status list
+    if poly_ok:
+        st.success(poly_msg + " — Intraday spot should work")
+    else:
+        st.error(poly_msg + " — Spot may be 0 / fallback won't work")
+
+    if uw_ok:
+        st.success(uw_msg)
+    else:
+        st.error(uw_msg)
+
+    if eod_ok:
+        st.success(eod_msg + " — Options chain IV should work")
+    else:
+        st.error(eod_msg + " — IV will be 0")
+
+    st.divider()
+    st.markdown(
+        """
+### Important
+- **Intraday spot** comes from **Polygon**, not EODHD.
+- EODHD is used for **options chain IV** only.
+- If your **Spot is 0**, it usually means **Polygon key missing/invalid**.
+"""
+    )
