@@ -882,7 +882,37 @@ with st.sidebar:
     st.success("UW_TOKEN") if UW_TOKEN else st.error("UW_TOKEN (missing)")
     st.info("EODHD_API_KEY (optional)") if EODHD_API_KEY else st.warning("EODHD_API_KEY (optional, missing)")
     st.info("FRED_API_KEY (optional)") if FRED_API_KEY else st.warning("FRED_API_KEY (optional, missing)")
+    # ============================================================
+    # 🔎 POLYGON DIAGNOSTICS (Temporary)
+    # ============================================================
+    st.divider()
+    st.subheader("Diagnostics")
 
+    if st.button("Test Polygon (marketstatus)"):
+        url = "https://api.polygon.io/v1/marketstatus/now"
+        code, text, _ = http_get(url, params={"apiKey": POLYGON_API_KEY}, timeout=15)
+        st.write("Status:", code)
+        st.code(text[:500])
+
+    if st.button("Test Polygon (aggs SPY 5m today)"):
+        if ET:
+            today_et = dt.datetime.now(tz=ET).date().isoformat()
+        else:
+            today_et = dt.date.today().isoformat()
+
+        url = f"https://api.polygon.io/v2/aggs/ticker/SPY/range/5/minute/{today_et}/{today_et}"
+        code, text, _ = http_get(
+            url,
+            params={
+                "apiKey": POLYGON_API_KEY,
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+            },
+            timeout=15,
+        )
+        st.write("Status:", code)
+        st.code(text[:500])
 
 # Auto-refresh
 st.caption(f"Last update (CT): {fmt_central(now_central())}")
