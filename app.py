@@ -913,7 +913,28 @@ with st.sidebar:
         )
         st.write("Status:", code)
         st.code(text[:500])
+    # ------------------------------------------------------------
+    # EODHD Intraday Diagnostic
+    # ------------------------------------------------------------
+    if st.button("Test EODHD intraday (SPY 5m last 6h)"):
+        end_utc = dt.datetime.now(tz=dt.timezone.utc)
+        start_utc = end_utc - dt.timedelta(hours=6)
 
+        url = "https://eodhd.com/api/intraday/SPY.US"
+        code, text, _ = http_get(
+            url,
+            params={
+                "api_token": EODHD_API_KEY,
+                "fmt": "json",
+                "interval": "5m",
+                "from": int(start_utc.timestamp()),
+                "to": int(end_utc.timestamp()),
+            },
+            timeout=20,
+        )
+
+        st.write("Status:", code)
+        st.code(text[:500])
 # Auto-refresh
 st.caption(f"Last update (CT): {fmt_central(now_central())}")
 st.markdown(f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>", unsafe_allow_html=True)
