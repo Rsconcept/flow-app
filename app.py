@@ -1,13 +1,16 @@
 # app.py
 # ============================================================
 # Institutional Options Signals (5m) — CALLS / PUTS ONLY
-# FIX: Real auto-refresh + live data (Streamlit Cloud compatible)
-# Uses streamlit-autorefresh (recommended).
+# FIXED: Polygon rate-limit (429) + true live refresh behavior
+# - App can rerun every X seconds
+# - Polygon calls are throttled per ticker (min interval)
+# - If Polygon 429 occurs, app keeps last good bars (does NOT go N/A)
 # ============================================================
 
 import os
 import json
 import math
+import time
 import datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -15,7 +18,6 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Auto-refresh helper (install via requirements.txt: streamlit-autorefresh)
 try:
     from streamlit_autorefresh import st_autorefresh
     HAS_AUTOREFRESH = True
@@ -55,7 +57,6 @@ def get_secret(name: str) -> Optional[str]:
         pass
     v = os.environ.get(name)
     return v.strip() if isinstance(v, str) and v.strip() else None
-
 
 POLYGON_API_KEY = get_secret("POLYGON_API_KEY")  # REQUIRED
 UW_TOKEN = get_secret("UW_TOKEN")                # REQUIRED
@@ -146,16 +147,46 @@ def volume_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
 
 
 # ============================================================
-# Polygon intraday bars
+# Polygon intraday bars (THROTTLED + CACHED)
 # ============================================================
 POLYGON_BASE = "https://api.polygon.io"
 
-@st.cache_data(ttl=3, show_spinner=False)  # very short TTL for live feel
-def polygon_intraday_bars(ticker: str, interval: str, lookback_minutes: int, include_extended: bool = True) -> Tuple[pd.DataFrame, str]:
+def _ss_init():
+    if "polygon_cache" not in st.session_state:
+        # key -> {"ts": float, "df": DataFrame, "status": str}
+        st.session_state["polygon_cache"] = {}
+    if "uw_cache" not in st.session_state:
+        st.session_state["uw_cache"] = {"ts": 0.0, "df": pd.DataFrame(), "status": "N/A"}
+
+_ss_init()
+
+def polygon_intraday_bars_throttled(
+    ticker: str,
+    interval: str,
+    lookback_minutes: int,
+    include_extended: bool,
+    min_fetch_sec: int,
+) -> Tuple[pd.DataFrame, str]:
+    """
+    - Enforces min_fetch_sec per ticker to avoid Polygon 429
+    - If Polygon returns 429, returns last cached bars instead of empty
+    """
     if not POLYGON_API_KEY:
         return pd.DataFrame(), "missing_key"
 
     t = ticker.upper().strip()
+
+    # session cache key includes params that affect data
+    key = (t, interval, int(lookback_minutes), bool(include_extended))
+
+    cache = st.session_state["polygon_cache"].get(key)
+    now = time.time()
+
+    # If cached and still fresh -> return it
+    if cache and (now - float(cache["ts"]) < float(min_fetch_sec)) and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
+        return cache["df"], f"cached({int(now - cache['ts'])}s)"
+
+    # Parse interval
     if not interval.endswith("m"):
         return pd.DataFrame(), "bad_interval"
     try:
@@ -177,6 +208,13 @@ def polygon_intraday_bars(ticker: str, interval: str, lookback_minutes: int, inc
     params = {"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 50000}
 
     code, text, _ = http_get(url, params=params, timeout=20)
+
+    # RATE LIMITED -> use cached bars if we have them
+    if code == 429:
+        if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
+            return cache["df"], "http_429 (using cached)"
+        return pd.DataFrame(), "http_429"
+
     if code != 200:
         j = safe_json(text)
         if isinstance(j, dict) and j.get("error"):
@@ -209,6 +247,7 @@ def polygon_intraday_bars(ticker: str, interval: str, lookback_minutes: int, inc
     if out.empty:
         return pd.DataFrame(), "empty"
 
+    # filter regular hours if requested
     if not include_extended and ET is not None:
         et_times = out["datetime"].dt.tz_convert(ET)
         regular = (
@@ -219,12 +258,19 @@ def polygon_intraday_bars(ticker: str, interval: str, lookback_minutes: int, inc
         if out.empty:
             return pd.DataFrame(), "empty_regular_only"
 
+    # clip to lookback window if possible
     cutoff = end_utc - dt.timedelta(minutes=lookback_minutes)
     clipped = out[out["datetime"] >= cutoff].copy()
     if not clipped.empty:
         out = clipped
     else:
-        out = out.tail(500).copy()
+        out = out.tail(1000).copy()
+
+    # Save to session cache
+    st.session_state["polygon_cache"][key] = {"ts": now, "df": out, "status": "ok"}
+
+    # small spacing between tickers to be polite with rate limits
+    time.sleep(0.15)
 
     return out, "ok"
 
@@ -234,7 +280,7 @@ def polygon_intraday_bars(ticker: str, interval: str, lookback_minutes: int, inc
 # ============================================================
 EODHD_BASE = "https://eodhd.com/api"
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
     if not EODHD_API_KEY:
         return pd.DataFrame(), "missing_key"
@@ -286,7 +332,7 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
     return out, "ok"
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def eodhd_options_chain_iv(ticker: str) -> Tuple[Optional[float], str]:
     if not EODHD_API_KEY:
         return None, "missing_key"
@@ -368,7 +414,7 @@ def fred_10y_yield() -> Tuple[Optional[float], str]:
 
 
 # ============================================================
-# Unusual Whales (robust)
+# Unusual Whales (robust; cached in session to reduce calls)
 # ============================================================
 def uw_headers() -> Dict[str, str]:
     return {
@@ -403,14 +449,25 @@ def _uw_premium_col(df: pd.DataFrame) -> Optional[str]:
 def _uw_oi_col(df: pd.DataFrame) -> Optional[str]:
     return _pick_first_existing(df, ["open_interest", "oi"])
 
-@st.cache_data(ttl=10, show_spinner=False)
-def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
+def uw_flow_alerts_session_cached(limit: int = 250, ttl_sec: int = 25) -> Tuple[pd.DataFrame, str]:
+    """
+    Session-level cache: avoids hammering UW every rerun.
+    """
     if not UW_TOKEN:
         return pd.DataFrame(), "missing_key"
 
+    now = time.time()
+    c = st.session_state["uw_cache"]
+    if (now - float(c["ts"])) < float(ttl_sec) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
+        return c["df"], f"cached({int(now - c['ts'])}s)"
+
     params = {"limit": limit}
     code, text, _ = http_get(UW_FLOW_ALERTS_URL, headers=uw_headers(), params=params)
+
     if code != 200:
+        # keep previous UW cache if we have it
+        if isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
+            return c["df"], f"http_{code} (using cached)"
         return pd.DataFrame(), f"http_{code}"
 
     j = safe_json(text)
@@ -424,7 +481,7 @@ def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
     else:
         return pd.DataFrame(), "parse_error"
 
-    # Extract nested greeks if present: {"greeks":{"gamma":..,"delta":..}}
+    # Extract nested greeks if present
     if "greeks" in df.columns:
         try:
             gamma_ex = df["greeks"].apply(lambda x: x.get("gamma") if isinstance(x, dict) else None)
@@ -440,6 +497,7 @@ def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
         except Exception:
             pass
 
+    st.session_state["uw_cache"] = {"ts": now, "df": df, "status": "ok"}
     return df, "ok"
 
 
@@ -450,6 +508,7 @@ def uw_put_call_bias(flow_df: pd.DataFrame, ticker: str) -> Tuple[Optional[float
     ucol = _uw_underlying_col(flow_df)
     tcol = _uw_option_type_col(flow_df)
     vcol = _uw_size_like_col(flow_df)
+
     if tcol is None:
         return None, "N/A"
 
@@ -472,6 +531,11 @@ def uw_put_call_bias(flow_df: pd.DataFrame, ticker: str) -> Tuple[Optional[float
 
 
 def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
+    """
+    Best-effort gamma bias:
+    - Uses gamma field if UW provides it (or greeks.gamma extracted)
+    - If gamma is missing, returns 'N/A (gamma not provided)'
+    """
     if flow_df is None or flow_df.empty:
         return "N/A"
 
@@ -481,8 +545,10 @@ def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
     scol = _uw_size_like_col(df)
     gcol = _pick_first_existing(df, ["gamma", "g", "gamma_value", "greeks_gamma"])
 
-    if tcol is None or gcol is None:
+    if tcol is None:
         return "N/A"
+    if gcol is None:
+        return "N/A (gamma not provided)"
 
     t = ticker.upper().strip()
     if ucol is not None:
@@ -502,7 +568,7 @@ def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
 
 
 # ============================================================
-# Scoring (fast start on 5m)
+# Scoring
 # ============================================================
 def score_signal(
     df_bars: pd.DataFrame,
@@ -667,9 +733,11 @@ with st.sidebar:
 
     news_lookback = st.slider("News lookback (minutes)", 15, 720, 360, 15)  # default 360
     refresh_sec = st.slider("Auto-refresh (seconds)", 5, 120, 20, 1)        # default 20
-
-    st.divider()
     inst_threshold = st.slider("Institutional mode: signals only if confidence ≥", 50, 95, 80, 1)  # default 80
+
+    # IMPORTANT: Throttle to avoid Polygon 429
+    st.divider()
+    min_polygon_fetch = st.slider("Min seconds between Polygon requests per ticker (prevents 429)", 10, 180, 60, 5)
 
     st.divider()
     st.caption("Weights (don’t have to sum to 1)")
@@ -691,25 +759,24 @@ with st.sidebar:
 
 
 # ============================================================
-# REAL AUTO-REFRESH (works on Streamlit Cloud)
+# REAL AUTO-REFRESH
 # ============================================================
 if HAS_AUTOREFRESH:
-    st_autorefresh(interval=refresh_sec * 1000, key="live_autorefresh")
+    st_autorefresh(interval=refresh_sec * 1000, key="live_autorefresh_v2")
 else:
-    st.warning("Auto-refresh helper not installed. Add 'streamlit-autorefresh' to requirements.txt for live refresh.")
+    st.warning("Auto-refresh helper not installed. Add 'streamlit-autorefresh' to requirements.txt.")
 
-
-st.caption(f"Now (CST): {fmt_cst(now_cst())}  |  Interval={interval}  |  Refresh={refresh_sec}s")
+st.caption(f"Now (CST): {fmt_cst(now_cst())} | Interval={interval} | Refresh={refresh_sec}s | Polygon min/ticker={min_polygon_fetch}s")
 
 ten_y_val, ten_y_status = fred_10y_yield()
-flow_df, flow_status = uw_flow_alerts(limit=250)
+flow_df, flow_status = uw_flow_alerts_session_cached(limit=250, ttl_sec=25)
 
 # Status row
 status_cols = st.columns([1, 1, 1, 1], gap="small")
 
 def status_box(label: str, status: str):
-    if status == "ok":
-        st.success(f"{label} (ok)")
+    if status == "ok" or str(status).startswith("cached("):
+        st.success(f"{label} ({status})")
     elif status in ("empty", "N/A", "missing_key"):
         st.warning(f"{label} ({status})")
     elif str(status).startswith("http_"):
@@ -740,7 +807,10 @@ with right:
     news_frames: List[pd.DataFrame] = []
 
     for t in tickers:
-        bars, bars_status = polygon_intraday_bars(t, interval=interval, lookback_minutes=price_lookback, include_extended=include_extended)
+        bars, bars_status = polygon_intraday_bars_throttled(
+            t, interval=interval, lookback_minutes=price_lookback,
+            include_extended=include_extended, min_fetch_sec=min_polygon_fetch
+        )
 
         iv_now, iv_status = (None, "missing_key")
         news_df, news_status_raw = (pd.DataFrame(), "missing_key")
@@ -755,18 +825,20 @@ with right:
 
         out = score_signal(
             df_bars=bars,
-            flow_df=flow_df if flow_status == "ok" else pd.DataFrame(),
+            flow_df=flow_df if (flow_status == "ok" or str(flow_status).startswith("cached(")) else pd.DataFrame(),
             ticker=t,
             iv_now=iv_now,
             ten_y=ten_y_val if ten_y_status == "ok" else None,
             weights=weights,
         )
 
+        # override statuses for display
         out["Bars_status"] = bars_status
         out["IV_status"] = iv_status
         out["News_status"] = news_flag
         out["UW_flow_status"] = flow_status
         out["institutional"] = "YES" if out["confidence"] >= inst_threshold and out["signal"] != "WAIT" else "NO"
+
         rows.append(out)
 
     df_out = pd.DataFrame(rows)
@@ -781,7 +853,7 @@ with right:
         if c not in df_out.columns:
             df_out[c] = "N/A"
 
-    st.dataframe(df_out[show_cols], use_container_width=True, height=320)
+    st.dataframe(df_out[show_cols], use_container_width=True, height=330)
 
     st.subheader(f"Institutional Alerts (≥ {inst_threshold} only)")
     inst = df_out[df_out["institutional"] == "YES"].copy()
@@ -790,74 +862,6 @@ with right:
     else:
         for _, r in inst.sort_values("confidence", ascending=False).iterrows():
             st.success(f"{r['ticker']}: {r['signal']} • {r['direction']} • Confidence={int(r['confidence'])}")
-
-    # UW Filtered (DTE <= 7)
-    st.subheader("Unusual Flow Alerts (UW API) — filtered")
-    st.caption("Rules: premium ≥ $1,000,000 • DTE ≤ 7 days • Exclude ITM (best-effort). Volume>OI only if OI exists.")
-
-    if flow_status != "ok" or flow_df.empty:
-        st.warning("UW flow alerts not available right now.")
-    else:
-        f = flow_df.copy()
-        ucol = _uw_underlying_col(f)
-        tcol = _uw_option_type_col(f)
-        vcol = _uw_size_like_col(f)
-        pcol = _uw_premium_col(f)
-        oicol = _uw_oi_col(f)
-
-        if pcol is not None:
-            f["premium_num"] = pd.to_numeric(f[pcol], errors="coerce")
-        else:
-            f["premium_num"] = pd.NA
-
-        if vcol is not None:
-            f["volume_num"] = pd.to_numeric(f[vcol], errors="coerce")
-        else:
-            f["volume_num"] = pd.NA
-
-        if oicol is not None:
-            f["oi_num"] = pd.to_numeric(f[oicol], errors="coerce")
-        else:
-            f["oi_num"] = pd.NA
-
-        exp_col = _pick_first_existing(f, ["expiry", "expiration", "exp", "expiration_date"])
-        if exp_col is not None:
-            f["expiry_dt"] = pd.to_datetime(f[exp_col], errors="coerce", utc=True)
-            f["dte"] = (f["expiry_dt"] - dt.datetime.now(tz=UTC)).dt.total_seconds() / 86400.0
-        else:
-            f["dte"] = pd.NA
-
-        filt = pd.Series([True] * len(f))
-        filt &= (f["premium_num"].fillna(0) >= 1_000_000)
-        filt &= (f["dte"].fillna(999) <= 7)
-
-        if oicol is not None:
-            filt &= (f["volume_num"].fillna(0) > f["oi_num"].fillna(10**18))
-
-        strike_col = _pick_first_existing(f, ["strike"])
-        und_col = _pick_first_existing(f, ["underlying_price", "underlyingPrice", "stock_price", "spot", "underlying_last"])
-        if strike_col is not None and und_col is not None and tcol is not None:
-            strike = pd.to_numeric(f[strike_col], errors="coerce")
-            und = pd.to_numeric(f[und_col], errors="coerce")
-            opt = f[tcol].astype(str).str.lower()
-            is_itm_call = opt.str.contains("call") & (und > strike)
-            is_itm_put = opt.str.contains("put") & (und < strike)
-            filt &= ~(is_itm_call | is_itm_put)
-
-        f2 = f[filt].copy()
-
-        display_cols = []
-        for c in ["executed_at", ucol, tcol, strike_col, exp_col, "premium_num", "volume_num", "oi_num", "delta", "gamma"]:
-            if c and c in f2.columns and c not in display_cols:
-                display_cols.append(c)
-
-        if display_cols:
-            show = f2[display_cols].head(80).copy()
-            if "executed_at" in show.columns:
-                show["executed_at"] = pd.to_datetime(show["executed_at"], errors="coerce", utc=True).dt.tz_convert(CST).dt.strftime("%Y-%m-%d %H:%M:%S CST")
-            st.dataframe(show, use_container_width=True, height=260)
-        else:
-            st.warning("UW data returned, but expected fields aren’t present to display neatly.")
 
     # News table
     st.subheader(f"News — last {news_lookback} minutes (EODHD)")
