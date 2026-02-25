@@ -1,26 +1,3 @@
-# app.py
-# ============================================================
-# Institutional Options Signals — CALLS / PUTS ONLY
-# Data: Polygon intraday (epoch-ms) + EODHD news/IV + UW flow + FRED 10Y
-# Fixes:
-#  - Prevents "yesterday last bar" by using Polygon epoch-ms window to NOW
-#  - True autorefresh via streamlit-autorefresh + JS fallback
-#  - Throttles to avoid 429: per-ticker min interval + cooldown after 429
-#  - Clear stale detection + Age_min display
-#  - News_status YES/Not Yet
-#  - UW put/call vol proxy + gamma bias proxy (best effort)
-#
-# Defaults requested:
-#  - Candle interval default: 5m
-#  - Price lookback default: 900 minutes
-#  - News lookback default: 360 minutes
-#  - Institutional default: 80
-#  - Auto-refresh default: 20 seconds
-#  - Throttles (4 tickers): min per ticker 90s, cooldown after 429 180s
-#  - Limit to 9 tickers at once
-#  - UW filtered alerts DTE <= 7 days
-# ============================================================
-
 import os, json, math, time, datetime as dt
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -43,14 +20,11 @@ except Exception:
 # -----------------------------
 # Page config
 # -----------------------------
-st.set_page_config(
-    page_title="Institutional Options Signals — CALLS / PUTS ONLY",
-    layout="wide",
-)
-
+st.set_page_config(page_title="Institutional Options Signals — CALLS / PUTS ONLY", layout="wide")
 APP_TITLE = "🏛️ Institutional Options Signals — CALLS / PUTS ONLY"
+
 UTC = dt.timezone.utc
-CST = dt.timezone(dt.timedelta(hours=-6))  # Display only (no DST)
+CST = dt.timezone(dt.timedelta(hours=-6))  # display only (no DST)
 ET = ZoneInfo("America/New_York") if ZoneInfo else None
 
 # -----------------------------
@@ -70,27 +44,32 @@ def get_secret(name: str) -> Optional[str]:
 POLYGON_API_KEY = get_secret("POLYGON_API_KEY")
 EODHD_API_KEY   = get_secret("EODHD_API_KEY")
 UW_TOKEN        = get_secret("UW_TOKEN")
-FRED_API_KEY    = get_secret("FRED_API_KEY")  # <-- required for 10Y
+FRED_API_KEY    = get_secret("FRED_API_KEY")
 UW_FLOW_ALERTS_URL = get_secret("UW_FLOW_ALERTS_URL") or "https://api.unusualwhales.com/api/option-trades/flow-alerts"
 
 # -----------------------------
 # HTTP helpers
 # -----------------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "flow-app/1.1"})
+SESSION.headers.update({"User-Agent": "flow-app/1.2", "Accept": "application/json,text/plain,*/*"})
 
-def http_get(url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Tuple[int, str]:
+def http_get(url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, timeout: int = 25) -> Tuple[int, str, Dict[str, str]]:
     try:
         r = SESSION.get(url, headers=headers, params=params, timeout=timeout)
-        return r.status_code, r.text
+        return r.status_code, r.text, dict(r.headers or {})
     except requests.RequestException as e:
-        return 0, str(e)
+        return 0, str(e), {}
 
-def safe_json(text: str) -> Optional[Any]:
+def try_json(text: str) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Returns (json_obj, error_string_if_any)
+    """
     try:
-        return json.loads(text)
+        return json.loads(text), None
     except Exception:
-        return None
+        snippet = (text or "").strip().replace("\n", " ")
+        snippet = snippet[:140] + ("..." if len(snippet) > 140 else "")
+        return None, snippet if snippet else "empty_body"
 
 # -----------------------------
 # Time helpers
@@ -127,7 +106,6 @@ def parse_interval_minutes(interval: str) -> int:
         return 5
 
 def in_live_hours(include_extended: bool) -> bool:
-    # Used for "stale" detection
     if ET is None:
         return True
     t = now_et()
@@ -180,13 +158,14 @@ if "poly_cache" not in st.session_state:
     st.session_state["poly_cache"] = {}   # key -> {"ts": epoch, "df": df, "last_bar": dt}
 if "poly_cd_until" not in st.session_state:
     st.session_state["poly_cd_until"] = {}  # key -> epoch time
+if "poly_last_request_global" not in st.session_state:
+    st.session_state["poly_last_request_global"] = 0.0
 
-# UW cache (we fetch once per refresh)
 if "uw_cache" not in st.session_state:
     st.session_state["uw_cache"] = {"ts": 0.0, "df": pd.DataFrame(), "status": "N/A"}
 
 # -----------------------------
-# Polygon intraday (epoch-ms window to NOW)
+# Polygon intraday (robust)
 # -----------------------------
 POLYGON_BASE = "https://api.polygon.io"
 
@@ -197,6 +176,7 @@ def polygon_bars(
     include_extended: bool,
     min_fetch_sec: int,
     cooldown_429_sec: int,
+    global_spacing_ms: int,
 ) -> Tuple[pd.DataFrame, str]:
     if not POLYGON_API_KEY:
         return pd.DataFrame(), "missing_key"
@@ -212,20 +192,17 @@ def polygon_bars(
     # If in cooldown, return cache if exists
     if now < cd_until:
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
-            return cache["df"], f"cooldown({int(cd_until-now)}s) cached"
-        return pd.DataFrame(), f"cooldown({int(cd_until-now)}s)"
+            return cache["df"], f"http_429 (cooldown {int(cd_until-now)}s, cached)"
+        return pd.DataFrame(), f"http_429 (cooldown {int(cd_until-now)}s)"
 
-    # Cache usage if fresh enough & not stale
+    # cache hit if fresh enough
     stale = False
     if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
         last_bar = cache.get("last_bar")
         a = age_minutes(last_bar) if isinstance(last_bar, dt.datetime) else None
 
-        # During live hours, if last bar too old => stale
         if in_live_hours(include_extended) and a is not None and a > max(3.0, mult * 2.4):
             stale = True
-
-        # New trading day => stale
         if ET and isinstance(last_bar, dt.datetime) and in_live_hours(include_extended):
             if last_bar.astimezone(ET).date() < now_et().date():
                 stale = True
@@ -234,40 +211,65 @@ def polygon_bars(
         if (not stale) and (age_sec < float(min_fetch_sec)):
             return cache["df"], f"cached({int(age_sec)}s)"
 
-    # Force fetch
+    # GLOBAL SPACING (prevents bursts on Streamlit Cloud)
+    last_global = float(st.session_state.get("poly_last_request_global", 0.0))
+    wait = (global_spacing_ms / 1000.0) - (time.time() - last_global)
+    if wait > 0:
+        time.sleep(min(wait, 1.25))
+    st.session_state["poly_last_request_global"] = time.time()
+
+    # Build window to NOW (epoch-ms)
     end_dt = now_utc()
     start_dt = end_dt - dt.timedelta(minutes=lookback_minutes)
     from_ms = int(start_dt.timestamp() * 1000)
     to_ms = int(end_dt.timestamp() * 1000)
 
     url = f"{POLYGON_BASE}/v2/aggs/ticker/{t}/range/{mult}/minute/{from_ms}/{to_ms}"
-    params = {
-        "apiKey": POLYGON_API_KEY,
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-    }
+    params = {"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 50000}
 
-    code, text = http_get(url, params=params, timeout=20)
+    code, text, headers = http_get(url, params=params, timeout=25)
 
+    # Handle 429
     if code == 429:
         st.session_state["poly_cd_until"][key] = time.time() + float(cooldown_429_sec)
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
             return cache["df"], f"http_429 (cooldown {cooldown_429_sec}s, cached)"
         return pd.DataFrame(), f"http_429 (cooldown {cooldown_429_sec}s)"
 
+    # Non-200
     if code != 200:
-        j = safe_json(text)
-        msg = j.get("error") if isinstance(j, dict) else None
+        j, nonjson = try_json(text)
+        msg = None
+        if isinstance(j, dict):
+            msg = j.get("error") or j.get("message")
+        status = f"http_{code}"
+        if msg:
+            status += f" — {msg}"
+        elif nonjson:
+            status += f" — {nonjson}"
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
-            return cache["df"], f"http_{code} (cached)"
-        return pd.DataFrame(), f"http_{code}" + (f" — {msg}" if msg else "")
+            return cache["df"], f"{status} (cached)"
+        return pd.DataFrame(), status
 
-    j = safe_json(text)
+    # 200 but might be non-json
+    j, nonjson = try_json(text)
+    if j is None:
+        # show snippet so you SEE what polygon returned
+        if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
+            return cache["df"], f"poly_non_json: {nonjson} (cached)"
+        return pd.DataFrame(), f"poly_non_json: {nonjson}"
+
+    # Polygon JSON error payload
+    if isinstance(j, dict) and j.get("status") == "ERROR":
+        err = j.get("error") or j.get("message") or "unknown_error"
+        if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
+            return cache["df"], f"poly_error: {err} (cached)"
+        return pd.DataFrame(), f"poly_error: {err}"
+
     if not isinstance(j, dict) or "results" not in j:
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
-            return cache["df"], "parse_error (cached)"
-        return pd.DataFrame(), "parse_error"
+            return cache["df"], "poly_schema_mismatch (cached)"
+        return pd.DataFrame(), "poly_schema_mismatch"
 
     results = j.get("results") or []
     if not results:
@@ -275,27 +277,28 @@ def polygon_bars(
             return cache["df"], "empty (cached)"
         return pd.DataFrame(), "empty"
 
-    df = pd.DataFrame(results)
+    raw = pd.DataFrame(results)
     needed = ["t", "o", "h", "l", "c", "v"]
-    if any(c not in df.columns for c in needed):
+    if any(c not in raw.columns for c in needed):
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
             return cache["df"], "schema_mismatch (cached)"
         return pd.DataFrame(), "schema_mismatch"
 
     out = pd.DataFrame()
-    out["datetime"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    out["open"] = pd.to_numeric(df["o"], errors="coerce")
-    out["high"] = pd.to_numeric(df["h"], errors="coerce")
-    out["low"] = pd.to_numeric(df["l"], errors="coerce")
-    out["close"] = pd.to_numeric(df["c"], errors="coerce")
-    out["volume"] = pd.to_numeric(df["v"], errors="coerce")
+    out["datetime"] = pd.to_datetime(raw["t"], unit="ms", utc=True)
+    out["open"] = pd.to_numeric(raw["o"], errors="coerce")
+    out["high"] = pd.to_numeric(raw["h"], errors="coerce")
+    out["low"] = pd.to_numeric(raw["l"], errors="coerce")
+    out["close"] = pd.to_numeric(raw["c"], errors="coerce")
+    out["volume"] = pd.to_numeric(raw["v"], errors="coerce")
     out = out.dropna(subset=["datetime", "close"]).sort_values("datetime")
+
     if out.empty:
         if cache and isinstance(cache.get("df"), pd.DataFrame) and not cache["df"].empty:
             return cache["df"], "empty (cached)"
         return pd.DataFrame(), "empty"
 
-    # Filter to regular hours if requested
+    # Filter to regular session if requested
     if (not include_extended) and ET:
         et_times = out["datetime"].dt.tz_convert(ET)
         regular = (
@@ -310,10 +313,8 @@ def polygon_bars(
 
     last_bar = out["datetime"].iloc[-1].to_pydatetime()
 
-    # Save cache
     st.session_state["poly_cache"][key] = {"ts": time.time(), "df": out, "last_bar": last_bar}
 
-    # Stale flag if still old during live
     a = age_minutes(last_bar)
     if in_live_hours(include_extended) and a is not None and a > max(3.0, mult * 2.4):
         return out, f"stale(age={a}m)"
@@ -335,10 +336,10 @@ def fred_10y_yield() -> Tuple[Optional[float], str]:
         "sort_order": "desc",
         "limit": 1,
     }
-    code, text = http_get(url, params=params, timeout=20)
+    code, text, _ = http_get(url, params=params, timeout=20)
     if code != 200:
         return None, f"http_{code}"
-    j = safe_json(text)
+    j, nonjson = try_json(text)
     if not isinstance(j, dict) or "observations" not in j:
         return None, "parse_error"
     obs = j.get("observations") or []
@@ -346,13 +347,12 @@ def fred_10y_yield() -> Tuple[Optional[float], str]:
         return None, "empty"
     v = obs[0].get("value")
     try:
-        val = float(v)
-        return val, "ok"
+        return float(v), "ok"
     except Exception:
         return None, "parse_error"
 
 # -----------------------------
-# EODHD news
+# EODHD news + IV (unchanged)
 # -----------------------------
 EODHD_BASE = "https://eodhd.com/api"
 
@@ -363,10 +363,10 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
     t = ticker.upper().strip()
     url = f"{EODHD_BASE}/news"
     params = {"api_token": EODHD_API_KEY, "fmt": "json", "s": f"{t}.US", "limit": 80}
-    code, text = http_get(url, params=params, timeout=20)
+    code, text, _ = http_get(url, params=params, timeout=20)
     if code != 200:
         return pd.DataFrame(), f"http_{code}"
-    j = safe_json(text)
+    j, nonjson = try_json(text)
     if not isinstance(j, list):
         return pd.DataFrame(), "parse_error"
 
@@ -374,7 +374,6 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
     if df.empty:
         return pd.DataFrame(), "ok"
 
-    # Normalize published time
     if "date" in df.columns:
         df["published_utc"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
     elif "published_at" in df.columns:
@@ -383,7 +382,7 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
         df["published_utc"] = pd.NaT
 
     df["published_cst"] = df["published_utc"].dt.tz_convert(CST)
-    cutoff = now_cst() - dt.timedelta(minutes=lookback_minutes)
+    cutoff = dt.datetime.now(tz=CST) - dt.timedelta(minutes=lookback_minutes)
     df = df[df["published_cst"] >= cutoff].copy()
     if df.empty:
         return pd.DataFrame(), "ok"
@@ -407,26 +406,21 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
     out = out.dropna(subset=["title"]).head(60)
     return out, "ok"
 
-# -----------------------------
-# EODHD options IV (best effort)
-# -----------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def eodhd_options_chain_iv(ticker: str) -> Tuple[Optional[float], str]:
     if not EODHD_API_KEY:
         return None, "missing_key"
-
     t = ticker.upper().strip()
     url = f"{EODHD_BASE}/options/{t}.US"
     params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-    code, text = http_get(url, params=params, timeout=20)
+    code, text, _ = http_get(url, params=params, timeout=20)
     if code != 200:
         return None, f"http_{code}"
-    j = safe_json(text)
+    j, nonjson = try_json(text)
     if not isinstance(j, dict):
         return None, "parse_error"
 
     iv_vals: List[float] = []
-
     def walk(obj):
         if isinstance(obj, dict):
             for k, v in obj.items():
@@ -440,60 +434,44 @@ def eodhd_options_chain_iv(ticker: str) -> Tuple[Optional[float], str]:
         elif isinstance(obj, list):
             for it in obj:
                 walk(it)
-
     walk(j)
+
     if not iv_vals:
         return None, "no_iv"
 
     iv = float(pd.Series(iv_vals).dropna().median())
-
-    # scale fix
     if iv > 200:
         return None, "iv_bad_scale"
     iv_pct = iv * 100.0 if iv <= 2.0 else iv
     return round(iv_pct, 2), "ok"
 
 # -----------------------------
-# Unusual Whales (flow alerts)
+# Unusual Whales
 # -----------------------------
-UW_BASE = "https://api.unusualwhales.com/api"
-
 def uw_headers() -> Dict[str, str]:
-    return {
-        "Accept": "application/json, text/plain",
-        "Authorization": f"Bearer {UW_TOKEN}" if UW_TOKEN else "",
-    }
+    return {"Accept": "application/json, text/plain", "Authorization": f"Bearer {UW_TOKEN}" if UW_TOKEN else ""}
 
 def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
     if not UW_TOKEN:
         return pd.DataFrame(), "missing_key"
 
-    # Respect cache (avoid hammering UW)
     now = time.time()
     cache = st.session_state["uw_cache"]
     if isinstance(cache.get("df"), pd.DataFrame) and (now - float(cache.get("ts", 0.0)) < 20):
         return cache["df"], cache.get("status", "ok")
 
-    # Use either user-provided URL or safe fallback
-    url = UW_FLOW_ALERTS_URL
-    params = {"limit": limit}
-
-    code, text = http_get(url, headers=uw_headers(), params=params, timeout=20)
+    code, text, _ = http_get(UW_FLOW_ALERTS_URL, headers=uw_headers(), params={"limit": limit}, timeout=20)
     if code != 200:
         st.session_state["uw_cache"] = {"ts": time.time(), "df": pd.DataFrame(), "status": f"http_{code}"}
         return pd.DataFrame(), f"http_{code}"
 
-    j = safe_json(text)
+    j, nonjson = try_json(text)
     if not isinstance(j, dict) or "data" not in j:
         st.session_state["uw_cache"] = {"ts": time.time(), "df": pd.DataFrame(), "status": "parse_error"}
         return pd.DataFrame(), "parse_error"
 
     data = j.get("data") or []
-    if not isinstance(data, list) or not data:
-        st.session_state["uw_cache"] = {"ts": time.time(), "df": pd.DataFrame(), "status": "ok"}
-        return pd.DataFrame(), "ok"
-
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
     st.session_state["uw_cache"] = {"ts": time.time(), "df": df, "status": "ok"}
     return df, "ok"
 
@@ -503,21 +481,15 @@ def uw_put_call_bias(flow_df: pd.DataFrame, ticker: str) -> Tuple[Optional[float
     t = ticker.upper()
     df = flow_df.copy()
 
-    # Filter to ticker if possible
     for sym_col in ["underlying_symbol", "ticker", "symbol"]:
         if sym_col in df.columns:
             df = df[df[sym_col].astype(str).str.upper() == t]
             break
 
-    if df.empty:
+    if df.empty or "option_type" not in df.columns:
         return None, "N/A"
 
-    # option_type
-    if "option_type" not in df.columns:
-        return None, "N/A"
     types = df["option_type"].astype(str).str.lower()
-
-    # volume proxy preference order
     vol_series = None
     for c in ["volume", "size", "total_size", "contracts"]:
         if c in df.columns:
@@ -533,15 +505,8 @@ def uw_put_call_bias(flow_df: pd.DataFrame, ticker: str) -> Tuple[Optional[float
     return round(put_vol / call_vol, 2), "ok"
 
 def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
-    """
-    UW payload often doesn't include per-contract gamma.
-    We'll compute a best-effort proxy:
-      - If 'gamma' exists: sum(gamma * size * sign(call/put))
-      - Else: use premium-weighted bias as fallback ("premium proxy")
-    """
     if flow_df is None or flow_df.empty:
         return "N/A"
-
     t = ticker.upper()
     df = flow_df.copy()
 
@@ -549,14 +514,12 @@ def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
         if sym_col in df.columns:
             df = df[df[sym_col].astype(str).str.upper() == t]
             break
-
     if df.empty:
         return "N/A"
 
     opt_type = df["option_type"].astype(str).str.lower() if "option_type" in df.columns else pd.Series([""] * len(df))
     sign = opt_type.map(lambda x: 1.0 if x == "call" else (-1.0 if x == "put" else 0.0))
 
-    # size
     size = None
     for c in ["size", "total_size", "volume", "contracts"]:
         if c in df.columns:
@@ -572,7 +535,6 @@ def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
             return "Neutral"
         return "Positive" if score > 0 else "Negative"
 
-    # premium proxy fallback
     prem = None
     for c in ["premium", "total_premium", "total_premium_usd"]:
         if c in df.columns:
@@ -656,19 +618,16 @@ def score_signal(
     out["EMA_stack"] = "Bull" if ema_stack_bull else ("Bear" if ema_stack_bear else "Neutral")
     out["Vol_ratio"] = round(float(vr), 2) if not (pd.isna(vr) or math.isinf(vr)) else "N/A"
 
-    # UW bias
     pc_ratio, _ = uw_put_call_bias(flow_df, ticker)
     out["Put/Call_vol"] = pc_ratio if pc_ratio is not None else "N/A"
     out["UW_bias"] = "PUT" if (pc_ratio is not None and pc_ratio > 1.1) else ("CALL" if (pc_ratio is not None and pc_ratio < 0.9) else "Neutral")
     out["Gamma_bias"] = gamma_bias_proxy(flow_df, ticker)
 
-    # IV spike (simple heuristic)
     if iv_now is None:
         out["IV_spike"] = "N/A"
     else:
         out["IV_spike"] = "YES" if iv_now >= 65 else "NO"
 
-    # Stale detection (if in live hours)
     mult = parse_interval_minutes(interval)
     if in_live_hours(include_extended) and a is not None and a > max(3.0, mult * 2.4):
         out["Bars_status"] = f"stale(age={a}m)"
@@ -676,30 +635,25 @@ def score_signal(
     bull = 0.0
     bear = 0.0
 
-    # RSI extremes
     if not pd.isna(rsi_v):
         if rsi_v <= 30:
             bull += weights["rsi"]
         elif rsi_v >= 70:
             bear += weights["rsi"]
 
-    # MACD
     if not pd.isna(macd_v):
         if macd_v > 0:
             bull += weights["macd"]
         elif macd_v < 0:
             bear += weights["macd"]
 
-    # VWAP
     (bull if vwap_above else bear).__iadd__(weights["vwap"])
 
-    # EMA stack
     if ema_stack_bull:
         bull += weights["ema"]
     elif ema_stack_bear:
         bear += weights["ema"]
 
-    # Volume confirmation
     if isinstance(out["Vol_ratio"], (int, float)) and out["Vol_ratio"] != "N/A":
         if out["Vol_ratio"] >= 1.5:
             if not pd.isna(macd_v) and macd_v > 0:
@@ -707,15 +661,12 @@ def score_signal(
             elif not pd.isna(macd_v) and macd_v < 0:
                 bear += weights["vol"]
 
-    # UW bias contribution
     if out["UW_bias"] == "CALL":
         bull += weights["uw"]
     elif out["UW_bias"] == "PUT":
         bear += weights["uw"]
 
-    # 10Y (simple bias): high yield headwind, low yield tailwind
     if ten_y is not None:
-        # tweak these thresholds as you like
         if ten_y >= 4.75:
             bear += weights["teny"]
         elif ten_y <= 4.0:
@@ -749,90 +700,73 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.header("Settings")
 
-    # Limit tickers to 9
     ticker_text = st.text_input("Type any tickers (comma-separated).", value="SPY,TSLA,AMD,META")
     tickers = [t.strip().upper() for t in ticker_text.split(",") if t.strip()]
-    tickers = list(dict.fromkeys(tickers))[:9]
+    tickers = list(dict.fromkeys(tickers))[:9]  # limit 9 tickers
 
     interval = st.selectbox("Candle interval", ["5m", "1m", "15m"], index=0)
-
     price_lookback = st.slider("Price lookback (minutes)", 60, 1980, 900, 30)
-
     include_extended = st.toggle("Include pre/after-hours (Polygon)", value=True)
-
     news_lookback = st.slider("News lookback (minutes)", 15, 720, 360, 15)
-
     refresh_sec = st.slider("Auto-refresh (seconds)", 10, 120, 20, 5)
 
     inst_threshold = st.slider("Institutional mode: signals only if confidence ≥", 50, 95, 80, 1)
 
     st.divider()
     st.subheader("Throttle controls (Polygon)")
-    min_fetch_sec = st.number_input("Min seconds between Polygon requests per ticker (prevents 429)", min_value=10, max_value=600, value=90, step=5)
-    cooldown_429_sec = st.number_input("Cooldown after 429 (seconds)", min_value=30, max_value=900, value=180, step=10)
+    min_fetch_sec = st.number_input("Min seconds between Polygon requests per ticker", 10, 600, 90, 5)
+    cooldown_429_sec = st.number_input("Cooldown after 429 (seconds)", 30, 900, 180, 10)
+    global_spacing_ms = st.number_input("Global spacing between Polygon requests (ms)", 0, 2000, 350, 50)
 
     st.divider()
-    st.caption("Weights (don’t have to sum to 1)")
+    st.caption("Weights")
     w_rsi = st.slider("RSI weight", 0.00, 0.30, 0.15, 0.01)
     w_macd = st.slider("MACD weight", 0.00, 0.30, 0.15, 0.01)
     w_vwap = st.slider("VWAP weight", 0.00, 0.30, 0.15, 0.01)
-    w_ema  = st.slider("EMA stack (9/20/50) weight", 0.00, 0.30, 0.18, 0.01)
+    w_ema  = st.slider("EMA stack weight", 0.00, 0.30, 0.18, 0.01)
     w_vol  = st.slider("Volume ratio weight", 0.00, 0.30, 0.12, 0.01)
     w_uw   = st.slider("UW flow weight", 0.00, 0.40, 0.20, 0.01)
     w_teny = st.slider("10Y yield weight", 0.00, 0.20, 0.05, 0.01)
-
     weights = {"rsi": w_rsi, "macd": w_macd, "vwap": w_vwap, "ema": w_ema, "vol": w_vol, "uw": w_uw, "teny": w_teny}
 
     st.divider()
     st.subheader("Keys status")
-    st.success("POLYGON_API_KEY") if bool(POLYGON_API_KEY) else st.error("POLYGON_API_KEY missing")
-    st.success("UW_TOKEN") if bool(UW_TOKEN) else st.error("UW_TOKEN missing")
-    st.success("EODHD_API_KEY") if bool(EODHD_API_KEY) else st.error("EODHD_API_KEY missing")
-    st.success("FRED_API_KEY") if bool(FRED_API_KEY) else st.error("FRED_API_KEY missing (10Y won't work)")
+    st.success("POLYGON_API_KEY") if POLYGON_API_KEY else st.error("POLYGON_API_KEY missing")
+    st.success("UW_TOKEN") if UW_TOKEN else st.error("UW_TOKEN missing")
+    st.success("EODHD_API_KEY") if EODHD_API_KEY else st.error("EODHD_API_KEY missing")
+    st.success("FRED_API_KEY") if FRED_API_KEY else st.error("FRED_API_KEY missing (10Y won't work)")
 
-# -----------------------------
-# Auto-refresh
-# -----------------------------
-header_line = f"Now (CST): {fmt_cst(now_cst())} | Interval={interval} | Refresh={refresh_sec}s | Polygon min/ticker={min_fetch_sec}s"
-st.caption(header_line)
+st.caption(f"Now (CST): {fmt_cst(now_cst())} | Interval={interval} | Refresh={refresh_sec}s | min/ticker={min_fetch_sec}s")
 
 if HAS_AUTOREFRESH:
-    st_autorefresh(interval=refresh_sec * 1000, key="autorefresh")
+    st_autorefresh(interval=int(refresh_sec * 1000), key="autorefresh")
 else:
-    # JS fallback (works but can be throttled by browser)
-    st.markdown(f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>", unsafe_allow_html=True)
+    st.markdown(f"<script>setTimeout(()=>window.location.reload(), {int(refresh_sec*1000)});</script>", unsafe_allow_html=True)
 
-# -----------------------------
-# Shared data fetch (FRED + UW)
-# -----------------------------
+# Shared data
 ten_y_val, ten_y_status = fred_10y_yield()
 flow_df, flow_status = uw_flow_alerts(limit=250)
 
-# Endpoint status bar
-status_cols = st.columns(4)
-
-def status_box(col, label: str, status: str):
+# Status bar
+cols = st.columns(4)
+def pill(col, label, status):
     with col:
         if status == "ok":
             st.success(f"{label} (ok)")
-        elif status in ("empty", "N/A", "missing_key"):
+        elif status in ("missing_key", "N/A", "empty"):
             st.warning(f"{label} ({status})")
         else:
             st.error(f"{label} ({status})")
 
-status_box(status_cols[0], "UW flow-alerts", flow_status)
-status_box(status_cols[1], "Polygon intraday", "ok" if POLYGON_API_KEY else "missing_key")
-status_box(status_cols[2], "EODHD news/IV", "ok" if EODHD_API_KEY else "missing_key")
-status_box(status_cols[3], "FRED 10Y", ten_y_status)
+pill(cols[0], "UW flow-alerts", flow_status)
+pill(cols[1], "Polygon intraday", "ok" if POLYGON_API_KEY else "missing_key")
+pill(cols[2], "EODHD news/IV", "ok" if EODHD_API_KEY else "missing_key")
+pill(cols[3], "FRED 10Y", ten_y_status)
 
-# -----------------------------
-# Layout
-# -----------------------------
 left, right = st.columns([0.35, 0.65], gap="large")
 
 with left:
     st.subheader("Unusual Whales Screener (web view)")
-    st.caption("Embedded. True filtering is best done inside UW screener UI.")
     st.components.v1.iframe("https://unusualwhales.com/options-screener", height=720, scrolling=True)
 
 with right:
@@ -845,14 +779,15 @@ with right:
         bars, bars_status = polygon_bars(
             ticker=t,
             interval=interval,
-            lookback_minutes=price_lookback,
-            include_extended=include_extended,
+            lookback_minutes=int(price_lookback),
+            include_extended=bool(include_extended),
             min_fetch_sec=int(min_fetch_sec),
             cooldown_429_sec=int(cooldown_429_sec),
+            global_spacing_ms=int(global_spacing_ms),
         )
 
         iv_now, iv_status = eodhd_options_chain_iv(t)
-        news_df, news_status = eodhd_news(t, lookback_minutes=int(news_lookback))
+        news_df, _news_status = eodhd_news(t, lookback_minutes=int(news_lookback))
 
         news_yes = (news_df is not None) and (not news_df.empty)
         if news_yes:
@@ -866,14 +801,13 @@ with right:
             ten_y=ten_y_val if ten_y_status == "ok" else None,
             weights=weights,
             interval=interval,
-            include_extended=include_extended,
+            include_extended=bool(include_extended),
         )
 
         out["Bars_status"] = bars_status or out.get("Bars_status", "empty")
         out["IV_status"] = iv_status
         out["News_status"] = "YES" if news_yes else "Not Yet"
         out["UW_flow_status"] = flow_status
-
         out["institutional"] = "YES" if (out["confidence"] >= inst_threshold and out["signal"] != "WAIT") else "NO"
 
         rows.append(out)
@@ -881,13 +815,12 @@ with right:
     df_out = pd.DataFrame(rows)
 
     show_cols = [
-        "ticker", "confidence", "direction", "signal", "institutional",
-        "RSI", "MACD_hist", "VWAP_above", "EMA_stack", "Vol_ratio",
-        "UW_bias", "Put/Call_vol", "IV_now", "IV_spike", "Gamma_bias",
-        "10Y", "Bars", "Last_bar(CST)", "Age_min",
-        "Bars_status", "IV_status", "News_status", "UW_flow_status"
+        "ticker","confidence","direction","signal","institutional",
+        "RSI","MACD_hist","VWAP_above","EMA_stack","Vol_ratio",
+        "UW_bias","Put/Call_vol","IV_now","IV_spike","Gamma_bias","10Y",
+        "Bars","Last_bar(CST)","Age_min",
+        "Bars_status","IV_status","News_status","UW_flow_status"
     ]
-
     for c in show_cols:
         if c not in df_out.columns:
             df_out[c] = "N/A"
@@ -902,78 +835,12 @@ with right:
         for _, r in inst.sort_values("confidence", ascending=False).iterrows():
             st.success(f"{r['ticker']}: {r['signal']} • {r['direction']} • Confidence={int(r['confidence'])}")
 
-    # UW filtered alerts (DTE <= 7 days)
-    st.subheader("Unusual Flow Alerts (UW API) — filtered")
-    st.caption("Rules: premium ≥ $1,000,000 • DTE ≤ 7 days • Volume > OI • Exclude ITM (best-effort)")
-    if flow_status != "ok" or flow_df is None or flow_df.empty:
-        st.warning("UW flow alerts not available right now.")
-    else:
-        f = flow_df.copy()
-
-        # DTE
-        if "expiry" in f.columns:
-            f["expiry_dt"] = pd.to_datetime(f["expiry"], errors="coerce", utc=True)
-            f["dte"] = (f["expiry_dt"] - now_utc()).dt.total_seconds() / 86400.0
-        else:
-            f["dte"] = pd.NA
-
-        # Premium
-        prem_col = None
-        for c in ["premium", "total_premium", "total_premium_usd"]:
-            if c in f.columns:
-                prem_col = c
-                break
-        f["premium_num"] = pd.to_numeric(f[prem_col], errors="coerce") if prem_col else pd.NA
-
-        # Volume & OI
-        vol_col = "volume" if "volume" in f.columns else ("size" if "size" in f.columns else None)
-        oi_col = "open_interest" if "open_interest" in f.columns else None
-        f["volume_num"] = pd.to_numeric(f[vol_col], errors="coerce") if vol_col else pd.NA
-        f["oi_num"] = pd.to_numeric(f[oi_col], errors="coerce") if oi_col else pd.NA
-
-        filt = pd.Series([True] * len(f))
-        filt &= (f["premium_num"].fillna(0) >= 1_000_000)
-        filt &= (f["dte"].fillna(999) <= 7)
-
-        if "volume_num" in f.columns and "oi_num" in f.columns:
-            filt &= (f["volume_num"].fillna(0) > f["oi_num"].fillna(10**18))
-
-        # Stocks/ETF only if issue_type exists
-        if "issue_type" in f.columns:
-            it = f["issue_type"].astype(str).str.lower()
-            filt &= it.isin(["common stock", "etf"])
-
-        # Exclude ITM if strike + underlying + option_type exist
-        if "strike" in f.columns and "underlying_price" in f.columns and "option_type" in f.columns:
-            strike = pd.to_numeric(f["strike"], errors="coerce")
-            und = pd.to_numeric(f["underlying_price"], errors="coerce")
-            opt = f["option_type"].astype(str).str.lower()
-            is_itm_call = (opt == "call") & (und > strike)
-            is_itm_put  = (opt == "put") & (und < strike)
-            filt &= ~(is_itm_call | is_itm_put)
-
-        f2 = f[filt].copy()
-
-        cols = []
-        for c in ["executed_at", "underlying_symbol", "option_type", "strike", "expiry", "premium_num", "volume_num", "oi_num", "delta", "gamma"]:
-            if c in f2.columns:
-                cols.append(c)
-
-        if cols:
-            show = f2[cols].head(60).copy()
-            if "executed_at" in show.columns:
-                show["executed_at"] = pd.to_datetime(show["executed_at"], errors="coerce", utc=True).dt.tz_convert(CST).dt.strftime("%Y-%m-%d %H:%M:%S CST")
-            st.dataframe(show, use_container_width=True, height=260)
-        else:
-            st.warning("UW data returned but fields differ from expected.")
-
-    # News panel
     st.subheader(f"News — last {news_lookback} minutes (EODHD)")
     if not news_frames:
         st.info("No news in this lookback window.")
     else:
         news_all = pd.concat(news_frames, ignore_index=True)
-        for c in ["ticker", "published_cst", "source", "title", "url"]:
+        for c in ["ticker","published_cst","source","title","url"]:
             if c not in news_all.columns:
                 news_all[c] = ""
-        st.dataframe(news_all[["ticker", "published_cst", "source", "title", "url"]].head(60), use_container_width=True, height=240)
+        st.dataframe(news_all[["ticker","published_cst","source","title","url"]].head(60), use_container_width=True, height=240)
