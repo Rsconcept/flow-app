@@ -834,7 +834,26 @@ with st.sidebar:
     st.info("EODHD_API_KEY (optional)") if EODHD_API_KEY else st.warning("EODHD_API_KEY (optional, missing)")
     st.info("FRED_API_KEY (optional)") if FRED_API_KEY else st.warning("FRED_API_KEY (optional, missing)")
 
+st.divider()
+st.subheader("Diagnostics")
 
+if st.button("Test EODHD intraday (SPY 5m last 6h)"):
+    if not EODHD_API_KEY:
+        st.error("EODHD_API_KEY missing in secrets.")
+    else:
+        end_ts = int(dt.datetime.now(tz=UTC).timestamp())
+        start_ts = end_ts - 6 * 3600
+        url = f"https://eodhd.com/api/intraday/SPY.US"
+        params = {
+            "api_token": EODHD_API_KEY,
+            "interval": "5m",
+            "from": start_ts,
+            "to": end_ts,
+            "fmt": "json",
+        }
+        code, text, _ = http_get(url, params=params, timeout=20)
+        st.write("HTTP:", code)
+        st.code(text[:2000])
 # Auto-refresh
 st.caption(f"Last update (CT): {fmt_ct(now_ct(), use_12h=use_12h)}")
 st.markdown(f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>", unsafe_allow_html=True)
