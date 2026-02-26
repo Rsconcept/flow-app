@@ -1,19 +1,20 @@
 # app.py
 # ============================================================
 # Institutional Options Signals (5m) — CALLS / PUTS ONLY
-# FULL SCRIPT — Polygon intraday (primary) + UW flow + (optional) EODHD news/IV + (optional) FRED 10Y
+# Polygon intraday (PRIMARY) + UW flow + (optional) EODHD news/IV + (optional) FRED 10Y
 #
-# FIXES INCLUDED (per your requests):
-# 1) Last_bar issue: adds bar "freshness" check + cache-busting + force refresh button
-# 2) If Polygon is stale or errors: fallback to EODHD intraday bars (robust parsing: unix OR string datetime)
-# 3) Ticker search input is BLANK by default (no 4 default tickers)
-# 4) No API calls for bars until user enters at least one ticker
-# 5) Time display uses Central timezone with DST support (America/Chicago) + 12-hour clock
-# 6) Adds Last_bar_age_min column to diagnose staleness instantly
+# BEST MODIFICATION CHOSEN (per your plan limits):
+# ✅ Max 5 tickers
+# ✅ 1 Polygon call per ticker
+# ✅ Default auto-refresh = 60 seconds
+# ✅ Within 5 calls/minute (stable, no 429/403 chaos)
 #
-# Notes:
-# - Finviz is not a safe/robust OHLC fallback (scraping brittle). UW is flow-only (no candles).
-# - Best fallback for intraday OHLC here is EODHD intraday endpoint.
+# Other changes:
+# - Default news lookback = 60 minutes
+# - Removed EODHD intraday fallback (your EODHD intraday returns empty list)
+# - Rate-limit safe: shows "rate_limited" without crashing scoring
+# - Central timezone with DST support (America/Chicago) + 12h clock
+# - Ticker box blank by default (no default tickers)
 # ============================================================
 
 import os
@@ -45,6 +46,9 @@ UTC = dt.timezone.utc
 ET = ZoneInfo("America/New_York") if ZoneInfo else None
 CENTRAL = ZoneInfo("America/Chicago") if ZoneInfo else dt.timezone(dt.timedelta(hours=-6))
 
+POLYGON_BASE = "https://api.polygon.io"
+EODHD_BASE = "https://eodhd.com/api"
+
 
 # ============================================================
 # Secrets / env
@@ -61,10 +65,10 @@ def get_secret(name: str) -> Optional[str]:
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-POLYGON_API_KEY = get_secret("POLYGON_API_KEY")  # REQUIRED
-UW_TOKEN = get_secret("UW_TOKEN")                # REQUIRED
-EODHD_API_KEY = get_secret("EODHD_API_KEY")      # OPTIONAL (news/IV + intraday fallback)
-FRED_API_KEY = get_secret("FRED_API_KEY")        # OPTIONAL
+POLYGON_API_KEY = get_secret("POLYGON_API_KEY")  # REQUIRED for intraday bars
+UW_TOKEN = get_secret("UW_TOKEN")                # REQUIRED for flow alerts
+EODHD_API_KEY = get_secret("EODHD_API_KEY")      # OPTIONAL for news/IV (intraday not used)
+FRED_API_KEY = get_secret("FRED_API_KEY")        # OPTIONAL for 10Y yield
 
 UW_FLOW_ALERTS_URL = get_secret("UW_FLOW_ALERTS_URL") or "https://api.unusualwhales.com/api/option-trades/flow-alerts"
 
@@ -79,7 +83,7 @@ def http_get(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, Any]] = None,
-    timeout: int = 20,
+    timeout: int = 20
 ) -> Tuple[int, str, str]:
     try:
         resp = SESSION.get(url, headers=headers, params=params, timeout=timeout)
@@ -100,10 +104,10 @@ def safe_json(text: str) -> Optional[Any]:
 def now_utc() -> dt.datetime:
     return dt.datetime.now(tz=UTC)
 
-def now_central() -> dt.datetime:
+def now_ct() -> dt.datetime:
     return dt.datetime.now(tz=CENTRAL)
 
-def fmt_central(ts: Optional[dt.datetime]) -> str:
+def fmt_ct(ts: Optional[dt.datetime]) -> str:
     if not ts:
         return "N/A"
     try:
@@ -111,45 +115,13 @@ def fmt_central(ts: Optional[dt.datetime]) -> str:
     except Exception:
         return "N/A"
 
-def _interval_to_minutes(interval: str) -> int:
+def interval_to_minutes(interval: str) -> int:
     if interval.endswith("m"):
         try:
             return int(interval.replace("m", ""))
         except Exception:
             return 5
-    if interval.endswith("h"):
-        try:
-            return int(interval.replace("h", "")) * 60
-        except Exception:
-            return 60
     return 5
-
-def _is_active_session(include_extended: bool) -> bool:
-    """
-    Best-effort active-hours check (ET):
-      - extended: 04:00–20:00 ET
-      - regular : 09:30–16:00 ET
-    """
-    if ET is None:
-        return True
-    t = dt.datetime.now(tz=ET)
-    minutes = t.hour * 60 + t.minute
-    if include_extended:
-        return (4 * 60) <= minutes <= (20 * 60)
-    return (9 * 60 + 30) <= minutes <= (16 * 60)
-
-def _is_stale_bar(last_bar_utc: dt.datetime, interval_minutes: int, include_extended: bool) -> bool:
-    """
-    If session is active and last bar is too old, treat as stale.
-    Tolerance: max(7 minutes, 3 bars + 2 minutes).
-    """
-    if last_bar_utc.tzinfo is None:
-        last_bar_utc = last_bar_utc.replace(tzinfo=UTC)
-    if not _is_active_session(include_extended):
-        return False
-    age_min = (now_utc() - last_bar_utc).total_seconds() / 60.0
-    tolerance = max(7.0, (interval_minutes * 3.0) + 2.0)
-    return age_min > tolerance
 
 
 # ============================================================
@@ -190,16 +162,16 @@ def volume_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
 
 # ============================================================
 # Polygon intraday bars (PRIMARY)
+# - Rate-limit safe
+# - Cache-busted by bar boundary so you don't get "yesterday stuck"
 # ============================================================
-POLYGON_BASE = "https://api.polygon.io"
-
-@st.cache_data(ttl=12, show_spinner=False)
+@st.cache_data(ttl=55, show_spinner=False)
 def polygon_intraday_bars(
     ticker: str,
     interval: str,
     lookback_minutes: int,
     include_extended: bool = True,
-    cache_buster: int = 0,  # changes cache key
+    cache_buster: int = 0
 ) -> Tuple[pd.DataFrame, str]:
     if not POLYGON_API_KEY:
         return pd.DataFrame(), "missing_key"
@@ -215,6 +187,7 @@ def polygon_intraday_bars(
     end_utc = now_utc()
     start_utc = end_utc - dt.timedelta(minutes=lookback_minutes)
 
+    # Polygon uses date strings. Use ET dates for correctness around midnight.
     if ET is None:
         from_date = start_utc.date().isoformat()
         to_date = end_utc.date().isoformat()
@@ -226,16 +199,20 @@ def polygon_intraday_bars(
     params = {"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 50000}
 
     code, text, _ = http_get(url, params=params, timeout=20)
+
+    if code == 429:
+        return pd.DataFrame(), "rate_limited(429)"
+
     if code != 200:
         j = safe_json(text)
-        if isinstance(j, dict) and j.get("error"):
-            return pd.DataFrame(), f"http_{code} — {j.get('error')}"
+        if isinstance(j, dict):
+            msg = j.get("message") or j.get("error") or j.get("status") or ""
+            msg = str(msg)[:120]
+            return pd.DataFrame(), f"http_{code} {msg}".strip()
         return pd.DataFrame(), f"http_{code}"
 
     j = safe_json(text)
     if not isinstance(j, dict) or "results" not in j:
-        if isinstance(j, dict) and j.get("error"):
-            return pd.DataFrame(), f"parse_error — {j.get('error')}"
         return pd.DataFrame(), "parse_error"
 
     results = j.get("results") or []
@@ -259,6 +236,7 @@ def polygon_intraday_bars(
     if out.empty:
         return pd.DataFrame(), "empty"
 
+    # Filter regular session if requested (ET 9:30–16:00)
     if not include_extended and ET is not None:
         et_times = out["datetime"].dt.tz_convert(ET)
         regular = (
@@ -269,146 +247,12 @@ def polygon_intraday_bars(
         if out.empty:
             return pd.DataFrame(), "empty_regular_only"
 
+    # Clip to lookback
     cutoff = end_utc - dt.timedelta(minutes=lookback_minutes)
     clipped = out[out["datetime"] >= cutoff].copy()
     out = clipped if not clipped.empty else out.tail(500).copy()
 
     return out, "ok"
-
-
-# ============================================================
-# EODHD intraday bars (FALLBACK)
-# Robust parsing: unix seconds OR string datetime OR timestamp/date fields
-# ============================================================
-EODHD_BASE = "https://eodhd.com/api"
-
-@st.cache_data(ttl=20, show_spinner=False)
-def eodhd_intraday_bars(
-    ticker: str,
-    interval: str,
-    lookback_minutes: int,
-    cache_buster: int = 0,
-) -> Tuple[pd.DataFrame, str]:
-    if not EODHD_API_KEY:
-        return pd.DataFrame(), "missing_key"
-
-    t = ticker.upper().strip()
-    symbol = f"{t}.US"
-
-    # EODHD intraday officially supports 1m/5m/1h (and sometimes more on some plans)
-    if interval not in ("1m", "5m", "15m", "30m", "1h"):
-        return pd.DataFrame(), "bad_interval"
-
-    end_utc = now_utc()
-    start_utc = end_utc - dt.timedelta(minutes=lookback_minutes)
-
-    url = f"{EODHD_BASE}/intraday/{symbol}"
-    params = {
-        "api_token": EODHD_API_KEY,
-        "fmt": "json",
-        "interval": interval,
-        "from": int(start_utc.timestamp()),
-        "to": int(end_utc.timestamp()),
-    }
-
-    code, text, _ = http_get(url, params=params, timeout=20)
-    if code != 200:
-        return pd.DataFrame(), f"http_{code}"
-
-    j = safe_json(text)
-    if not isinstance(j, list) or not j:
-        return pd.DataFrame(), "empty"
-
-    df = pd.DataFrame(j)
-
-    # Find datetime column
-    dt_col = None
-    for c in ("datetime", "timestamp", "date"):
-        if c in df.columns:
-            dt_col = c
-            break
-
-    if dt_col is None or "close" not in df.columns:
-        return pd.DataFrame(), "schema_mismatch"
-
-    raw = df[dt_col]
-
-    # Attempt unix seconds parse
-    dt_unix = pd.to_datetime(pd.to_numeric(raw, errors="coerce"), unit="s", utc=True)
-
-    # If unix parse mostly failed, attempt string parse (often "YYYY-MM-DD HH:MM:SS")
-    if dt_unix.notna().sum() < max(3, int(len(df) * 0.2)):
-        dt_parsed = pd.to_datetime(raw, errors="coerce", utc=True)
-    else:
-        dt_parsed = dt_unix
-
-    out = pd.DataFrame()
-    out["datetime"] = dt_parsed
-    out["open"] = pd.to_numeric(df.get("open"), errors="coerce")
-    out["high"] = pd.to_numeric(df.get("high"), errors="coerce")
-    out["low"] = pd.to_numeric(df.get("low"), errors="coerce")
-    out["close"] = pd.to_numeric(df.get("close"), errors="coerce")
-    out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
-
-    out = out.dropna(subset=["datetime", "close"]).sort_values("datetime")
-    if out.empty:
-        return pd.DataFrame(), "empty"
-
-    cutoff = end_utc - dt.timedelta(minutes=lookback_minutes)
-    clipped = out[out["datetime"] >= cutoff].copy()
-    out = clipped if not clipped.empty else out.tail(500).copy()
-
-    return out, "ok"
-
-
-def get_intraday_bars(
-    ticker: str,
-    interval: str,
-    lookback_minutes: int,
-    include_extended: bool,
-) -> Tuple[pd.DataFrame, str]:
-    """
-    Primary: Polygon
-    If Polygon returns stale during active session -> fallback to EODHD intraday (if key)
-    If Polygon errors/empty -> fallback to EODHD intraday
-    """
-    mult_min = _interval_to_minutes(interval)
-    # cache-bust per bar boundary so stale cache doesn't stick
-    cache_buster = int(now_utc().timestamp() // max(60, mult_min * 60))
-
-    bars, status = polygon_intraday_bars(
-        ticker=ticker,
-        interval=interval,
-        lookback_minutes=lookback_minutes,
-        include_extended=include_extended,
-        cache_buster=cache_buster,
-    )
-
-    if status == "ok" and bars is not None and not bars.empty:
-        last_dt = bars["datetime"].iloc[-1].to_pydatetime()
-        if _is_stale_bar(last_dt, interval_minutes=mult_min, include_extended=include_extended):
-            fb, fb_status = eodhd_intraday_bars(
-                ticker=ticker,
-                interval=interval,
-                lookback_minutes=lookback_minutes,
-                cache_buster=cache_buster,
-            )
-            if fb_status == "ok" and fb is not None and not fb.empty:
-                return fb, "polygon_stale->eodhd_ok"
-            return bars, "polygon_stale"
-        return bars, "polygon_ok"
-
-    # Polygon failed or empty -> fallback
-    fb, fb_status = eodhd_intraday_bars(
-        ticker=ticker,
-        interval=interval,
-        lookback_minutes=lookback_minutes,
-        cache_buster=cache_buster,
-    )
-    if fb_status == "ok" and fb is not None and not fb.empty:
-        return fb, f"polygon_{status}->eodhd_ok"
-
-    return pd.DataFrame(), f"polygon_{status}; eodhd_{fb_status}"
 
 
 # ============================================================
@@ -444,7 +288,7 @@ def eodhd_news(ticker: str, lookback_minutes: int) -> Tuple[pd.DataFrame, str]:
         df["published_utc"] = pd.NaT
 
     df["published_ct"] = df["published_utc"].dt.tz_convert(CENTRAL)
-    cutoff = now_central() - dt.timedelta(minutes=lookback_minutes)
+    cutoff = now_ct() - dt.timedelta(minutes=lookback_minutes)
     df = df[df["published_ct"] >= cutoff].copy()
 
     def pick_col(*cands):
@@ -606,7 +450,6 @@ def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
             return pd.DataFrame(), "ok"
         df = pd.DataFrame(data)
 
-    # Extract nested greeks if present
     if "greeks" in df.columns:
         try:
             greeks = df["greeks"]
@@ -726,9 +569,10 @@ def score_signal(
 
     out["Bars"] = int(len(df_bars))
     last_bar_utc = df_bars["datetime"].iloc[-1].to_pydatetime()
-    out["Last_bar(CT)"] = fmt_central(last_bar_utc)
+    out["Last_bar(CT)"] = fmt_ct(last_bar_utc)
     try:
-        age_min = (now_utc() - (last_bar_utc if last_bar_utc.tzinfo else last_bar_utc.replace(tzinfo=UTC))).total_seconds() / 60.0
+        lb = last_bar_utc if last_bar_utc.tzinfo else last_bar_utc.replace(tzinfo=UTC)
+        age_min = (now_utc() - lb).total_seconds() / 60.0
         out["Last_bar_age_min"] = round(age_min, 1)
     except Exception:
         out["Last_bar_age_min"] = "N/A"
@@ -842,25 +686,33 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.header("Settings")
 
-    # Force refresh button (clears Streamlit cache)
     if st.button("Force refresh (clear cache)"):
         st.cache_data.clear()
         st.rerun()
 
     ticker_text = st.text_input(
         "Type tickers (comma-separated).",
-        value="",  # ✅ blank by default
-        placeholder="e.g. SPY, TSLA, AMD",
+        value="",
+        placeholder="e.g. SPY, TSLA, AMD, META, IWM",
     )
     tickers = [t.strip().upper() for t in ticker_text.split(",") if t.strip()]
-    tickers = list(dict.fromkeys(tickers))[:25]
+    tickers = list(dict.fromkeys(tickers))
+
+    # HARD CAP 5 tickers to respect plan limits
+    if len(tickers) > 5:
+        st.warning("Plan-safe mode: max 5 tickers (to avoid Polygon 429 rate limits). Extra tickers ignored.")
+        tickers = tickers[:5]
 
     interval = st.selectbox("Candle interval", ["15m", "5m", "1m"], index=1)
+
     price_lookback = st.slider("Price lookback (minutes)", 60, 1980, 900, 30)
     include_extended = st.toggle("Include pre/after-hours (Polygon)", value=True)
 
-    news_lookback = st.slider("News lookback (minutes)", 15, 720, 360, 15)
-    refresh_sec = st.slider("Auto-refresh (seconds)", 10, 120, 20, 5)
+    # ✅ Default news lookback = 60 minutes
+    news_lookback = st.slider("News lookback (minutes)", 15, 720, 60, 15)
+
+    # ✅ Default refresh = 60 seconds
+    refresh_sec = st.slider("Auto-refresh (seconds)", 10, 300, 60, 5)
 
     st.divider()
     inst_threshold = st.slider("Institutional mode: signals only if confidence ≥", 50, 95, 80, 1)
@@ -882,68 +734,17 @@ with st.sidebar:
     st.success("UW_TOKEN") if UW_TOKEN else st.error("UW_TOKEN (missing)")
     st.info("EODHD_API_KEY (optional)") if EODHD_API_KEY else st.warning("EODHD_API_KEY (optional, missing)")
     st.info("FRED_API_KEY (optional)") if FRED_API_KEY else st.warning("FRED_API_KEY (optional, missing)")
-    # ============================================================
-    # 🔎 POLYGON DIAGNOSTICS (Temporary)
-    # ============================================================
-    st.divider()
-    st.subheader("Diagnostics")
 
-    if st.button("Test Polygon (marketstatus)"):
-        url = "https://api.polygon.io/v1/marketstatus/now"
-        code, text, _ = http_get(url, params={"apiKey": POLYGON_API_KEY}, timeout=15)
-        st.write("Status:", code)
-        st.code(text[:500])
 
-    if st.button("Test Polygon (aggs SPY 5m today)"):
-        if ET:
-            today_et = dt.datetime.now(tz=ET).date().isoformat()
-        else:
-            today_et = dt.date.today().isoformat()
-
-        url = f"https://api.polygon.io/v2/aggs/ticker/SPY/range/5/minute/{today_et}/{today_et}"
-        code, text, _ = http_get(
-            url,
-            params={
-                "apiKey": POLYGON_API_KEY,
-                "adjusted": "true",
-                "sort": "asc",
-                "limit": 50000,
-            },
-            timeout=15,
-        )
-        st.write("Status:", code)
-        st.code(text[:500])
-    # ------------------------------------------------------------
-    # EODHD Intraday Diagnostic
-    # ------------------------------------------------------------
-    if st.button("Test EODHD intraday (SPY 5m last 6h)"):
-        end_utc = dt.datetime.now(tz=dt.timezone.utc)
-        start_utc = end_utc - dt.timedelta(hours=6)
-
-        url = "https://eodhd.com/api/intraday/SPY.US"
-        code, text, _ = http_get(
-            url,
-            params={
-                "api_token": EODHD_API_KEY,
-                "fmt": "json",
-                "interval": "5m",
-                "from": int(start_utc.timestamp()),
-                "to": int(end_utc.timestamp()),
-            },
-            timeout=20,
-        )
-
-        st.write("Status:", code)
-        st.code(text[:500])
 # Auto-refresh
-st.caption(f"Last update (CT): {fmt_central(now_central())}")
+st.caption(f"Last update (CT): {fmt_ct(now_ct())}")
 st.markdown(f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>", unsafe_allow_html=True)
 
-# Shared data
+# Fetch shared data
 ten_y_val, ten_y_status = fred_10y_yield()
 flow_df, flow_status = uw_flow_alerts(limit=250)
 
-# Endpoint status
+# Endpoint status (top)
 status_cols = st.columns([1, 1, 1, 1], gap="small")
 
 def status_box(label: str, status: str):
@@ -951,7 +752,7 @@ def status_box(label: str, status: str):
         st.success(f"{label} (ok)")
     elif status in ("empty", "N/A", "missing_key"):
         st.warning(f"{label} ({status})")
-    elif str(status).startswith("http_"):
+    elif str(status).startswith("http_") or "rate_limited" in str(status):
         st.error(f"{label} ({status})")
     else:
         st.error(f"{label} ({status})")
@@ -961,7 +762,7 @@ with status_cols[0]:
 with status_cols[1]:
     status_box("Polygon intraday", "ok" if POLYGON_API_KEY else "missing_key")
 with status_cols[2]:
-    status_box("EODHD (fallback + news/IV)", "ok" if EODHD_API_KEY else "missing_key")
+    status_box("EODHD news/IV", "ok" if EODHD_API_KEY else "missing_key")
 with status_cols[3]:
     status_box("FRED 10Y", ten_y_status)
 
@@ -977,19 +778,39 @@ with right:
     st.subheader("Live Score / Signals (Intraday OHLC + EODHD headlines + UW flow)")
 
     if not tickers:
-        st.info("Enter one or more tickers in the sidebar to start (e.g., SPY, TSLA).")
+        st.info("Enter up to 5 tickers in the sidebar to start (e.g., SPY, TSLA).")
         st.stop()
 
     rows: List[Dict[str, Any]] = []
     news_frames: List[pd.DataFrame] = []
 
+    # Cache buster per bar boundary (keeps cache aligned with refresh)
+    mult_min = interval_to_minutes(interval)
+    cache_buster = int(now_utc().timestamp() // max(60, mult_min * 60))
+
     for t in tickers:
-        bars, bars_status = get_intraday_bars(
-            ticker=t,
-            interval=interval,
-            lookback_minutes=price_lookback,
-            include_extended=include_extended,
+        bars, bars_status = polygon_intraday_bars(
+            t, interval=interval, lookback_minutes=price_lookback,
+            include_extended=include_extended, cache_buster=cache_buster
         )
+
+        # If rate-limited, keep it explicit (no misleading scoring)
+        if "rate_limited" in bars_status:
+            out = score_signal(
+                df_bars=pd.DataFrame(),
+                flow_df=flow_df if flow_status == "ok" else pd.DataFrame(),
+                ticker=t,
+                iv_now=None,
+                ten_y=ten_y_val if ten_y_status == "ok" else None,
+                weights=weights,
+            )
+            out["Bars_status"] = bars_status
+            out["IV_status"] = "N/A"
+            out["News_status"] = "Not Yet"
+            out["UW_flow_status"] = flow_status
+            out["institutional"] = "NO"
+            rows.append(out)
+            continue
 
         iv_now, iv_status = (None, "missing_key")
         news_df, news_status_raw = (pd.DataFrame(), "missing_key")
@@ -1015,7 +836,6 @@ with right:
         out["IV_status"] = iv_status
         out["News_status"] = news_flag
         out["UW_flow_status"] = flow_status
-
         out["institutional"] = "YES" if out["confidence"] >= inst_threshold and out["signal"] != "WAIT" else "NO"
         rows.append(out)
 
