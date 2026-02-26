@@ -2,20 +2,30 @@
 # ============================================================
 # Institutional Options Signals (Intraday) — CALLS / PUTS ONLY
 #
-# CLEAN VERSION (EODHD PRIMARY)
-# - Intraday OHLC: EODHD (primary) ✅
-# - Options IV: EODHD ✅
-# - News: EODHD ✅ (default lookback 60 min)
-# - Flow: UnusualWhales (UW) ✅
-# - 10Y: FRED ✅ (optional)
+# CLEAN VERSION (EODHD PRIMARY) + UPGRADES
+# - Intraday OHLC: EODHD (primary)
+# - Options IV: EODHD
+# - News: EODHD (default lookback 60 min)
+# - Flow: UnusualWhales (UW)
+# - 10Y: FRED (optional)
 #
-# FIXES INCLUDED
-# - Tickers input defaults BLANK (max 5)
+# NEW UPGRADES (requested)
+# 1) Gamma_bias fallback:
+#    - If UW gamma is missing, we compute a fallback using PREMIUM-weighted CALL vs PUT flow.
+# 2) Vol_ratio improvements:
+#    - Adds Last_vol + Avg20_vol columns
+#    - Shows readable status instead of mysterious N/A when volume is missing/zero.
+# 3) IV_spike = REAL spike:
+#    - Keeps a per-ticker rolling IV baseline (median of last N IV values)
+#    - Spike if IV_now is meaningfully above baseline (ratio + absolute)
+#    - Displays IV_base so you can trust it.
+#
+# Other:
+# - Tickers default BLANK (max 5)
 # - CT time display in 12h format (e.g., 6:55 PM CT)
 # - Last_bar(CT) + Last_bar_age_min + stale detection
 # - Rate-safe mode: ROTATE tickers per refresh (default)
-# - Clear-cache button
-# - Diagnostics: test EODHD intraday + IV + news + UW + FRED
+# - Clear-cache button + Diagnostics
 # ============================================================
 
 import os
@@ -74,7 +84,7 @@ UW_FLOW_ALERTS_URL = get_secret("UW_FLOW_ALERTS_URL") or "https://api.unusualwha
 # HTTP helpers
 # ============================================================
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "streamlit-options-signals/clean-eodhd-1.0"})
+SESSION.headers.update({"User-Agent": "streamlit-options-signals/clean-eodhd-2.0"})
 
 
 def http_get(
@@ -155,14 +165,46 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     return pv.cumsum() / denom
 
 
-def volume_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
-    if len(df) < max(lookback, 2):
-        return float("nan")
-    last = df["volume"].iloc[-1]
-    avg = df["volume"].iloc[-lookback:].mean()
-    if avg == 0 or pd.isna(avg):
-        return float("nan")
-    return float(last / avg)
+def safe_float(x) -> Optional[float]:
+    try:
+        v = float(x)
+        if math.isfinite(v):
+            return v
+        return None
+    except Exception:
+        return None
+
+
+def volume_ratio_with_debug(df: pd.DataFrame, lookback: int = 20) -> Tuple[Optional[float], Optional[float], Optional[float], str]:
+    """
+    Returns:
+      (vol_ratio, last_vol, avg_vol, status)
+    """
+    if df is None or df.empty:
+        return None, None, None, "empty"
+
+    if "volume" not in df.columns:
+        return None, None, None, "missing_volume_col"
+
+    vol = pd.to_numeric(df["volume"], errors="coerce")
+    if vol.dropna().empty:
+        return None, None, None, "volume_all_nan"
+
+    if len(vol) < max(lookback, 2):
+        last_vol = safe_float(vol.iloc[-1])
+        avg_vol = safe_float(vol.mean())
+        return None, last_vol, avg_vol, f"too_few_bars_for_vr({len(vol)})"
+
+    last_vol = safe_float(vol.iloc[-1])
+    avg_vol = safe_float(vol.iloc[-lookback:].mean())
+
+    if avg_vol is None or avg_vol == 0:
+        return None, last_vol, avg_vol, "avg20_zero_or_nan"
+
+    if last_vol is None:
+        return None, last_vol, avg_vol, "last_vol_nan"
+
+    return round(last_vol / avg_vol, 2), last_vol, round(avg_vol, 2), "ok"
 
 
 # ============================================================
@@ -180,10 +222,7 @@ def eodhd_intraday_bars(
 ) -> Tuple[pd.DataFrame, str]:
     """
     Primary OHLC source.
-    IMPORTANT: Do NOT pass from/to to avoid empty results after-hours.
-    We fetch full session, then locally clip to lookback window.
-
-    interval: "1m", "5m", "15m", "1h"
+    We fetch latest available candles then locally clip to lookback window.
     """
     if not EODHD_API_KEY:
         return pd.DataFrame(), "missing_key"
@@ -242,7 +281,7 @@ def eodhd_intraday_bars(
     if not clipped.empty:
         out = clipped
     else:
-        # If after-hours and cutoff excludes everything, keep tail so indicators still compute
+        # After-hours / weekends: keep tail so indicators can compute
         out = out.tail(500).copy()
 
     return out, "ok"
@@ -418,6 +457,10 @@ def _uw_size_like_col(df: pd.DataFrame) -> Optional[str]:
     return _pick_first_existing(df, ["volume", "size", "contracts", "qty", "quantity"])
 
 
+def _uw_premium_col(df: pd.DataFrame) -> Optional[str]:
+    return _pick_first_existing(df, ["premium", "premium_usd", "total_premium", "notional", "premium_amount"])
+
+
 @st.cache_data(ttl=25, show_spinner=False)
 def uw_flow_alerts(limit: int = 250) -> Tuple[pd.DataFrame, str]:
     if not UW_TOKEN:
@@ -486,32 +529,125 @@ def uw_put_call_bias(flow_df: pd.DataFrame, ticker: str) -> Tuple[Optional[float
     return round(put_vol / call_vol, 2), "ok"
 
 
-def gamma_bias_proxy(flow_df: pd.DataFrame, ticker: str) -> str:
+def gamma_bias_or_fallback(flow_df: pd.DataFrame, ticker: str) -> Tuple[str, str]:
+    """
+    Returns (bias_label, method)
+      method:
+        - "gamma" (best)
+        - "premium_fallback"
+        - "N/A"
+    """
     if flow_df is None or flow_df.empty:
-        return "N/A"
+        return "N/A", "N/A"
 
     df = flow_df.copy()
     ucol = _uw_underlying_col(df)
     tcol = _uw_option_type_col(df)
     scol = _uw_size_like_col(df)
     gcol = _pick_first_existing(df, ["gamma", "g", "gamma_value", "greeks_gamma"])
-    if tcol is None or gcol is None:
-        return "N/A"
+    pcol = _uw_premium_col(df)
+
+    if tcol is None:
+        return "N/A", "N/A"
 
     t = ticker.upper().strip()
     if ucol is not None:
         df = df[df[ucol].astype(str).str.upper() == t].copy()
     if df.empty:
+        return "N/A", "N/A"
+
+    # 1) Try gamma method
+    if gcol is not None:
+        gamma = pd.to_numeric(df[gcol], errors="coerce").fillna(0)
+        size = _to_num_series(df[scol]) if scol is not None else pd.Series([1.0] * len(df))
+        opt = df[tcol].astype(str).str.lower()
+        sign = opt.map(lambda x: 1.0 if "call" in x else (-1.0 if "put" in x else 0.0))
+        score = float((gamma * size * sign).sum())
+
+        if abs(score) < 0.5:
+            return "Neutral", "gamma"
+        return ("Positive" if score > 0 else "Negative"), "gamma"
+
+    # 2) Premium-weighted fallback
+    if pcol is not None:
+        prem = pd.to_numeric(df[pcol], errors="coerce").fillna(0)
+        opt = df[tcol].astype(str).str.lower()
+        call_p = float(prem[opt.str.contains("call")].sum())
+        put_p = float(prem[opt.str.contains("put")].sum())
+        total = call_p + put_p
+        if total <= 0:
+            return "Neutral", "premium_fallback"
+
+        # convert to bias label similar to gamma output
+        # Positive => call premium dominates, Negative => put premium dominates
+        ratio = (call_p - put_p) / total  # -1..+1
+        if abs(ratio) < 0.10:
+            return "Neutral", "premium_fallback"
+        return ("Positive" if ratio > 0 else "Negative"), "premium_fallback"
+
+    return "N/A", "N/A"
+
+
+# ============================================================
+# IV baseline + spike detection (session-based)
+# ============================================================
+def update_iv_history(ticker: str, iv_now: Optional[float], max_len: int = 30) -> Optional[float]:
+    """
+    Stores iv_now into session history and returns current baseline (median).
+    Baseline is median of history (including latest if present).
+    """
+    if "iv_hist" not in st.session_state:
+        st.session_state.iv_hist = {}
+
+    if ticker not in st.session_state.iv_hist:
+        st.session_state.iv_hist[ticker] = []
+
+    hist: List[float] = st.session_state.iv_hist[ticker]
+
+    if iv_now is not None and math.isfinite(float(iv_now)):
+        hist.append(float(iv_now))
+        if len(hist) > max_len:
+            hist[:] = hist[-max_len:]
+
+    st.session_state.iv_hist[ticker] = hist
+    if len(hist) >= 5:
+        return float(pd.Series(hist).median())
+    return None
+
+
+def iv_spike_flag(iv_now: Optional[float], iv_base: Optional[float], ratio_thr: float = 1.35, abs_thr: float = 10.0) -> str:
+    """
+    Spike if:
+      - iv_now >= 65 (absolute "hot" IV)
+      OR
+      - iv_base exists and iv_now >= iv_base*ratio_thr AND iv_now - iv_base >= abs_thr
+    """
+    if iv_now is None:
         return "N/A"
 
-    gamma = pd.to_numeric(df[gcol], errors="coerce").fillna(0)
-    size = _to_num_series(df[scol]) if scol is not None else pd.Series([1.0] * len(df))
-    opt = df[tcol].astype(str).str.lower()
-    sign = opt.map(lambda x: 1.0 if "call" in x else (-1.0 if "put" in x else 0.0))
-    score = float((gamma * size * sign).sum())
-    if abs(score) < 0.5:
-        return "Neutral"
-    return "Positive" if score > 0 else "Negative"
+    try:
+        ivn = float(iv_now)
+    except Exception:
+        return "N/A"
+
+    if ivn >= 65:
+        return "YES"
+
+    if iv_base is None:
+        return "NO"
+
+    try:
+        ivb = float(iv_base)
+    except Exception:
+        return "NO"
+
+    if ivb <= 0:
+        return "NO"
+
+    if (ivn >= ivb * ratio_thr) and ((ivn - ivb) >= abs_thr):
+        return "YES"
+
+    return "NO"
 
 
 # ============================================================
@@ -522,6 +658,7 @@ def score_signal(
     flow_df: pd.DataFrame,
     ticker: str,
     iv_now: Optional[float],
+    iv_base: Optional[float],
     ten_y: Optional[float],
     weights: Dict[str, float],
     stale_after_min: float,
@@ -537,11 +674,16 @@ def score_signal(
         "VWAP_above": "N/A",
         "EMA_stack": "N/A",
         "Vol_ratio": "N/A",
+        "Last_vol": "N/A",
+        "Avg20_vol": "N/A",
+        "Vol_status": "N/A",
         "UW_bias": "N/A",
         "Put/Call_vol": "N/A",
         "IV_now": iv_now if iv_now is not None else "N/A",
+        "IV_base": iv_base if iv_base is not None else "N/A",
         "IV_spike": "N/A",
         "Gamma_bias": "N/A",
+        "Gamma_method": "N/A",
         "10Y": ten_y if ten_y is not None else "N/A",
         "Bars": 0,
         "Last_bar(CT)": "N/A",
@@ -552,6 +694,9 @@ def score_signal(
         "UW_flow_status": "N/A",
         "Data_source": "EODHD",
     }
+
+    # IV spike with baseline
+    out["IV_spike"] = iv_spike_flag(iv_now, iv_base)
 
     if df_bars is None or df_bars.empty:
         out["Bars_status"] = "empty"
@@ -568,6 +713,13 @@ def score_signal(
         out["Stale?"] = "N/A"
     else:
         out["Stale?"] = "YES" if age > stale_after_min else "NO"
+
+    # Volume debug + vol ratio
+    vr, last_v, avg_v, vstat = volume_ratio_with_debug(df_bars, lookback=20)
+    out["Vol_ratio"] = vr if vr is not None else "N/A"
+    out["Last_vol"] = last_v if last_v is not None else "N/A"
+    out["Avg20_vol"] = avg_v if avg_v is not None else "N/A"
+    out["Vol_status"] = vstat
 
     # Need a small minimum for stable calculations
     if len(df_bars) < 10:
@@ -587,13 +739,10 @@ def score_signal(
     ema_stack_bull = bool(ema9 > ema20 > ema50)
     ema_stack_bear = bool(ema9 < ema20 < ema50)
 
-    vr = volume_ratio(df_bars, 20)
-
     out["RSI"] = round(float(rsi_v), 2) if not pd.isna(rsi_v) else "N/A"
     out["MACD_hist"] = round(float(macd_v), 4) if not pd.isna(macd_v) else "N/A"
     out["VWAP_above"] = "Above" if vwap_above else "Below"
     out["EMA_stack"] = "Bull" if ema_stack_bull else ("Bear" if ema_stack_bear else "Neutral")
-    out["Vol_ratio"] = round(float(vr), 2) if not (pd.isna(vr) or math.isinf(vr)) else "N/A"
 
     # UW biases
     pc_ratio, _ = uw_put_call_bias(flow_df, ticker) if (flow_df is not None and not flow_df.empty) else (None, "N/A")
@@ -602,13 +751,10 @@ def score_signal(
         "PUT" if (pc_ratio is not None and pc_ratio > 1.1)
         else ("CALL" if (pc_ratio is not None and pc_ratio < 0.9) else "Neutral")
     )
-    out["Gamma_bias"] = gamma_bias_proxy(flow_df, ticker) if (flow_df is not None and not flow_df.empty) else "N/A"
 
-    # IV spike heuristic
-    if iv_now is None:
-        out["IV_spike"] = "N/A"
-    else:
-        out["IV_spike"] = "YES" if iv_now >= 65 else "NO"
+    gb, gm = gamma_bias_or_fallback(flow_df, ticker) if (flow_df is not None and not flow_df.empty) else ("N/A", "N/A")
+    out["Gamma_bias"] = gb
+    out["Gamma_method"] = gm
 
     bull = 0.0
     bear = 0.0
@@ -637,7 +783,7 @@ def score_signal(
     elif ema_stack_bear:
         bear += weights["ema"]
 
-    # Volume confirmation
+    # Volume confirmation only if ratio is valid
     if isinstance(out["Vol_ratio"], (int, float)):
         if out["Vol_ratio"] >= 1.5:
             if not pd.isna(macd_v) and macd_v > 0:
@@ -681,16 +827,16 @@ def score_signal(
 
 
 # ============================================================
-# UI
+# UI / Session init
 # ============================================================
 st.title(APP_TITLE)
 
-# Session storage for rate-safe rotation
 if "rotate_idx" not in st.session_state:
     st.session_state.rotate_idx = 0
 if "last_good" not in st.session_state:
-    # per-ticker last good bars (df), status
     st.session_state.last_good = {}
+if "iv_hist" not in st.session_state:
+    st.session_state.iv_hist = {}
 
 
 def clear_cache_and_reload():
@@ -737,6 +883,12 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("IV Spike Settings (relative)")
+    iv_hist_len = st.slider("IV baseline history length (samples)", 10, 60, 30, 5)
+    iv_ratio_thr = st.slider("Spike ratio vs baseline", 1.10, 2.00, 1.35, 0.05)
+    iv_abs_thr = st.slider("Spike absolute points above baseline", 5.0, 50.0, 10.0, 1.0)
+
+    st.divider()
     st.caption("Weights (don’t have to sum to 1)")
     w_rsi = st.slider("RSI weight", 0.00, 0.30, 0.15, 0.01)
     w_macd = st.slider("MACD weight", 0.00, 0.30, 0.15, 0.01)
@@ -779,6 +931,8 @@ with st.sidebar:
     if st.button("Test UW flow (limit 50)"):
         df, s = uw_flow_alerts(limit=50)
         st.write("Status:", s, "Rows:", 0 if df is None else len(df))
+        if df is not None and not df.empty:
+            st.dataframe(df.head(20), use_container_width=True)
 
     if st.button("Test FRED 10Y"):
         v, s = fred_10y_yield()
@@ -791,10 +945,11 @@ st.markdown(f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000
 
 # Shared data
 ten_y_val, ten_y_status = fred_10y_yield()
-flow_df, flow_status = uw_flow_alerts(limit=250)
+flow_df, flow_status = uw_flow_alerts(limit=250) if UW_TOKEN else (pd.DataFrame(), "missing_key")
 
 # Status row (top)
 status_cols = st.columns([1, 1, 1], gap="small")
+
 
 def status_box(label: str, status: str):
     if status == "ok":
@@ -806,10 +961,11 @@ def status_box(label: str, status: str):
     else:
         st.error(f"{label} ({status})")
 
+
 with status_cols[0]:
     status_box("EODHD (primary)", "ok" if EODHD_API_KEY else "missing_key")
 with status_cols[1]:
-    status_box("UW flow-alerts", flow_status if UW_TOKEN else "missing_key")
+    status_box("UW flow-alerts", flow_status)
 with status_cols[2]:
     status_box("FRED 10Y", ten_y_status)
 
@@ -831,7 +987,6 @@ with right:
         st.stop()
 
     # Decide which tickers to refresh this cycle
-    tickers_to_refresh: List[str]
     if mode.startswith("ROTATE"):
         idx = st.session_state.rotate_idx % len(tickers)
         tickers_to_refresh = [tickers[idx]]
@@ -864,11 +1019,15 @@ with right:
                 bars = pd.DataFrame()
                 bars_status = "no_cache"
 
-        # IV + news (lightweight; still use cache decorators)
+        # IV + baseline + spike
         iv_now, iv_status = (None, "missing_key")
-        news_df, news_status_raw = (pd.DataFrame(), "missing_key")
         if EODHD_API_KEY:
             iv_now, iv_status = eodhd_options_chain_iv(t)
+        iv_base = update_iv_history(t, iv_now, max_len=int(iv_hist_len))
+
+        # News
+        news_df, news_status_raw = (pd.DataFrame(), "missing_key")
+        if EODHD_API_KEY:
             news_df, news_status_raw = eodhd_news(t, lookback_minutes=news_lookback)
             if news_status_raw == "ok" and news_df is not None and not news_df.empty:
                 news_frames.append(news_df)
@@ -880,15 +1039,20 @@ with right:
             flow_df=flow_df if (flow_status == "ok") else pd.DataFrame(),
             ticker=t,
             iv_now=iv_now,
+            iv_base=iv_base,
             ten_y=ten_y_val if ten_y_status == "ok" else None,
             weights=weights,
             stale_after_min=float(stale_after_min),
         )
 
+        # Override IV spike thresholds from sidebar
+        # (uses the same logic but with your chosen thresholds)
+        out["IV_spike"] = iv_spike_flag(iv_now, iv_base, ratio_thr=float(iv_ratio_thr), abs_thr=float(iv_abs_thr))
+
         out["Bars_status"] = bars_status
         out["IV_status"] = iv_status
         out["News_status"] = news_flag
-        out["UW_flow_status"] = flow_status if UW_TOKEN else "missing_key"
+        out["UW_flow_status"] = flow_status
 
         out["institutional"] = "YES" if out["confidence"] >= inst_threshold and out["signal"] != "WAIT" else "NO"
         rows.append(out)
@@ -897,8 +1061,12 @@ with right:
 
     show_cols = [
         "ticker", "confidence", "direction", "signal", "institutional",
-        "RSI", "MACD_hist", "VWAP_above", "EMA_stack", "Vol_ratio",
-        "UW_bias", "Put/Call_vol", "IV_now", "IV_spike", "Gamma_bias", "10Y",
+        "RSI", "MACD_hist", "VWAP_above", "EMA_stack",
+        "Vol_ratio", "Last_vol", "Avg20_vol", "Vol_status",
+        "UW_bias", "Put/Call_vol",
+        "IV_now", "IV_base", "IV_spike",
+        "Gamma_bias", "Gamma_method",
+        "10Y",
         "Bars", "Last_bar(CT)", "Last_bar_age_min", "Stale?",
         "Bars_status", "IV_status", "News_status", "UW_flow_status", "Data_source",
     ]
@@ -906,7 +1074,7 @@ with right:
         if c not in df_out.columns:
             df_out[c] = "N/A"
 
-    st.dataframe(df_out[show_cols], use_container_width=True, height=300)
+    st.dataframe(df_out[show_cols], use_container_width=True, height=320)
 
     st.subheader(f"Institutional Alerts (≥ {inst_threshold} only)")
     inst = df_out[df_out["institutional"] == "YES"].copy()
@@ -926,5 +1094,9 @@ with right:
         for c in ["ticker", "published_ct", "source", "title", "url"]:
             if c not in news_all.columns:
                 news_all[c] = ""
-        st.dataframe(news_all[["ticker", "published_ct", "source", "title", "url"]].head(80), use_container_width=True, height=240)
+        st.dataframe(
+            news_all[["ticker", "published_ct", "source", "title", "url"]].head(80),
+            use_container_width=True,
+            height=240
+        )
         st.caption("Tip: Click URL column links (or copy/paste).")
